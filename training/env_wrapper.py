@@ -24,13 +24,14 @@ from doom_env import spaces as S
 
 from training.wad_gen import build_map_pool
 
-CELL_SIZE = 128.0  # Tile-scale exploration grid (rewards reaching corners, switches & exits)
+CELL_SIZE = 96.0  # Exact 1-tile exploration grid (matches wad_gen TILE_SIZE = 96.0)
 KEY_ENTITY_ID = S.ENTITY_TYPES.index("key")
 ENEMY_ENTITY_IDS = {
     S.ENTITY_TYPES.index("enemy_melee"),
     S.ENTITY_TYPES.index("enemy_hitscan"),
     S.ENTITY_TYPES.index("enemy_projectile"),
 }
+RAY_WALL_ID = 1
 RAY_DOOR_ID = 2
 RAY_LOCKED_ID = 3  # env/doom_env/sensors.py RAY_LOCKED
 RAY_ENEMY_ID = 4
@@ -44,6 +45,7 @@ def stripped_obs_space() -> gym.spaces.Dict:
     return gym.spaces.Dict(
         {
             "rgb": gym.spaces.Box(0, 255, (60, 80, 3), np.uint8),
+            "depth": gym.spaces.Box(0, 255, (60, 80), np.uint8),
             "vitals": full["vitals"],
             "rays": full["rays"],
             "visible_entities": full["visible_entities"],
@@ -54,6 +56,7 @@ def stripped_obs_space() -> gym.spaces.Dict:
 def strip_obs(obs: dict) -> dict:
     return {
         "rgb": np.ascontiguousarray(obs["rgb"][::2, ::2, :]),
+        "depth": np.ascontiguousarray(obs["depth"][::2, ::2]),
         "vitals": obs["vitals"],
         "rays": obs["rays"],
         "visible_entities": obs["visible_entities"],
@@ -140,27 +143,36 @@ class ShapedDoomEnv(gym.Env):
         # Urgency cost when out of combat & anti-wall-stall shaping (discourages circling/hugging walls)
         ents = obs["visible_entities"]
         enemy_visible = ((ents["mask"] == 1) & np.isin(ents["entity_type"], list(ENEMY_ENTITY_IDS))).any()
-        enemy_in_front = (obs["rays"]["hit_type"][FRONT_RAY_IDX] == RAY_ENEMY_ID).any()
+        front_types = obs["rays"]["hit_type"][FRONT_RAY_IDX]
+        front_dists = obs["rays"]["distance"][FRONT_RAY_IDX]
+        enemy_in_front = (front_types == RAY_ENEMY_ID).any()
+        door_in_front = (((front_types == RAY_DOOR_ID) | (front_types == RAY_LOCKED_ID)) & (front_dists < 0.25)).any()
+
         if not enemy_visible and not enemy_in_front:
             reward -= 0.003
-            if abs(float(obs["vitals"][14])) < 1.5 and abs(float(obs["vitals"][15])) < 1.5:
+            if abs(float(obs["vitals"][14])) < 1.5 and abs(float(obs["vitals"][15])) < 1.5 and not door_in_front:
                 reward -= 0.015
         if self._prev_use == 1 and int(act[7]) == 1:
             # USE is rising-edge button-down: holding it continuously is ignored by DOOM
             reward -= 0.015
+        if int(act[7]) == 1:
+            close_door = (((front_types == RAY_DOOR_ID) | (front_types == RAY_LOCKED_ID)) & (front_dists < 0.18)).any()
+            close_wall = ((front_types == RAY_WALL_ID) & (front_dists < 0.14)).any()
+            if not close_door and not close_wall:
+                reward -= 0.010
 
-        # 1) Tile-scale episodic exploration (128x128 cells): rewards sweeping rooms & corners
+        # 1) Tile-scale episodic exploration (96x96 cells): rewards sweeping rooms & corners
         #    and resets exploration breadcrumbs once a keycard is picked up to reward backtracking.
         cell = (int(ps["x"] // CELL_SIZE), int(ps["y"] // CELL_SIZE))
         self._all_visited.add(cell)
         if cell not in self._visited:
             self._visited.add(cell)
-            reward += 0.05 if self._post_key_mode else 0.08
+            reward += 0.04 if self._post_key_mode else 0.07
 
-        # 2) Combat & ammo discipline (reward decisive kills & survival pickups without timidity)
+        # 2) Combat & ammo discipline (reward decisive kills, punish shooting doors or empty walls)
         dkills = ps["kills"] - prev["kills"]
         if dkills > 0:
-            reward += 0.75 * dkills
+            reward += 0.70 * dkills
         ditems = ps["items"] - prev["items"]
         if ditems > 0:
             reward += 0.12 * ditems
@@ -169,10 +181,10 @@ class ShapedDoomEnv(gym.Env):
             reward += 0.25
         ddmg = max(0.0, ps["damage_taken"] - prev["damage_taken"])
         if ddmg > 0:
-            reward -= 0.010 * ddmg
+            reward -= 0.008 * ddmg
 
         if act[6] == 1 and not enemy_visible and not enemy_in_front:
-            reward -= 0.008
+            reward -= 0.060 if door_in_front else 0.015
 
         # 3) Keycards sighting, monotonic approach & pickup
         key_slots = (ents["mask"] == 1) & (ents["entity_type"] == KEY_ENTITY_ID)
@@ -195,9 +207,6 @@ class ShapedDoomEnv(gym.Env):
             self._post_key_mode = True
 
         # 4) Normal doors & locked doors: front-cone approach + opening
-        front_types = obs["rays"]["hit_type"][FRONT_RAY_IDX]
-        front_dists = obs["rays"]["distance"][FRONT_RAY_IDX]
-
         front_doors = front_types == RAY_DOOR_ID
         if front_doors.any():
             if not self._saw_door:
@@ -229,11 +238,11 @@ class ShapedDoomEnv(gym.Env):
                 sid_int = int(sid)
                 if sid_int not in self._opened_doors:
                     self._opened_doors.add(sid_int)
-                    reward += 3.5 if dlock[sid_int] > 0 else 0.70
+                    reward += 3.5 if dlock[sid_int] > 0 else 0.80
                     self._best_door_dist = 2.0
                     self._saw_door = False
-            closing_door = (dlock >= 0) & (ceil < self._prev_door_ceil - 0.5) & (ceil > 8.0)
-            if act[7] == 1 and closing_door.any():
+            moving_door = (dlock >= 0) & (np.abs(ceil - self._prev_door_ceil) > 0.5) & (ceil > 8.0)
+            if act[7] == 1 and moving_door.any():
                 reward -= 0.08
             self._prev_door_ceil = ceil.copy()
 
@@ -241,7 +250,7 @@ class ShapedDoomEnv(gym.Env):
         if ps["exit_reached"]:
             time_frac = max(0.0, 1.0 - ps["tic"] / max(1, ps["episode_ticks"]))
             health_frac = min(1.0, max(0.0, ps["health"] / 100.0))
-            reward += 8.5 + 2.0 * time_frac + 1.0 * health_frac
+            reward += 9.0 + 2.0 * time_frac + 1.0 * health_frac
         elif ps["dead"]:
             reward -= 2.0
 

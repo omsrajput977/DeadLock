@@ -25,7 +25,7 @@ class DoomAgent:
         self.action_space = action_space
         self.device = torch.device(device)
         self.deterministic = False
-        self.temperature = 0.45
+        self.temperature = 0.50
 
         ckpt = torch.load(WEIGHTS_PATH, map_location=self.device, weights_only=True) if WEIGHTS_PATH.is_file() else None
         cfg = ModelConfig(**ckpt["config"]) if (ckpt and "config" in ckpt) else ModelConfig()
@@ -49,6 +49,5 @@ class DoomAgent:
             logits, obs_t["vitals"], deterministic=self.deterministic, temperature=self.temperature
         )
 
-        gru_h, spatial_map, _ = next_state
-        self._state = (gru_h, spatial_map, action_t)
+        self._state = self.policy.advance_state(next_state, action_t)
         return action_t.squeeze(0).cpu().numpy().astype(np.int8)

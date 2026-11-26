@@ -255,8 +255,8 @@ def _carve_corridor(
     return tiles
 
 
-def generate_map_text(tier: int, seed: int) -> str:
-    """Generate a procedural UDMF map string for tier in {1, 2, 3, 4}."""
+def generate_map_with_layout(tier: int, seed: int) -> tuple[str, dict]:
+    """Generate a procedural UDMF map string and training-time layout metadata for tier in {1, 2, 3, 4}."""
     rng = random.Random(seed)
     grid: dict[tuple[int, int], int] = {}
     sectors: list[SectorSpec] = []
@@ -309,7 +309,17 @@ def generate_map_text(tier: int, seed: int) -> str:
         for ix, iy in candidates[n_enemies : n_enemies + rng.randint(2, 4)]:
             things.append(((ix + 0.5) * TILE_SIZE, (iy + 0.5) * TILE_SIZE, 0, rng.choice(pickup_pool)))
 
-        return _grid_to_udmf(grid, sectors, things, wall_tex)
+        layout = {
+            "tile_size": TILE_SIZE,
+            "grid": grid,
+            "door_lock_map": {},
+            "door_sectors": set(),
+            "key_items": [],
+            "exit_xy": exit_xy,
+            "exit_switch_only": False,
+            "exit_wall_dir": None,
+        }
+        return _grid_to_udmf(grid, sectors, things, wall_tex), layout
 
     # Multi-room connected layout on a slot grid (includes 2-room combat+door for 40% of Tier 1)
     if tier == 1:
@@ -492,7 +502,29 @@ def generate_map_text(tier: int, seed: int) -> str:
                 continue
             things.append((px, py, 0, rng.choice((THING_STIMPACK, THING_MEDIKIT, THING_CLIP, THING_SHELLS, THING_ARMOR))))
 
-    return _grid_to_udmf(grid, sectors, things, wall_tex)
+    exit_wall_dir = None
+    if use_switch:
+        for dx, dy in ((1, 0), (0, 1), (-1, 0), (0, -1)):
+            if (ex_ix + dx, ex_iy + dy) not in grid:
+                exit_wall_dir = (dx, dy)
+                break
+    tid_to_lock = {tid: lnum for lnum, tid, _ in LOCK_KEYS}
+    layout = {
+        "tile_size": TILE_SIZE,
+        "grid": grid,
+        "door_lock_map": {idx: s.door_lock for idx, s in enumerate(sectors) if s.is_door},
+        "door_sectors": {idx for idx, s in enumerate(sectors) if s.is_door},
+        "key_items": [(rooms_by_slot[kslot].cx, rooms_by_slot[kslot].cy, tid_to_lock[ktid]) for kslot, ktid in key_placements],
+        "exit_xy": (ex_ix, ex_iy),
+        "exit_switch_only": use_switch,
+        "exit_wall_dir": exit_wall_dir,
+    }
+    return _grid_to_udmf(grid, sectors, things, wall_tex), layout
+
+
+def generate_map_text(tier: int, seed: int) -> str:
+    """Generate a procedural UDMF map string for tier in {1, 2, 3, 4}."""
+    return generate_map_with_layout(tier=tier, seed=seed)[0]
 
 
 def write_procedural_wad(out_path: str | Path, tier: int, seed: int, map_name: str = "MAP01") -> Path:

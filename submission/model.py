@@ -110,8 +110,9 @@ class ModelConfig:
     map_channels: int = 16
     map_size: int = 25
     map_range: float = 1200.0  # +/- 1200 map units around player (~96 units/cell)
-    gru_hidden: int = 192
+    gru_hidden: int = 256
     frame_skip: int = 4
+    use_depth: bool = True
 
 
 def preprocess_obs_dict(obs: dict, device: torch.device) -> dict[str, torch.Tensor]:
@@ -126,6 +127,12 @@ def preprocess_obs_dict(obs: dict, device: torch.device) -> dict[str, torch.Tens
         ent_mask = np.asarray(obs["visible_entities"]["mask"], dtype=np.float32)[None, :]
         vitals = np.asarray(obs["vitals"], dtype=np.float32)[None, :]
         rgb = np.asarray(obs["rgb"], dtype=np.uint8)[None, ...]
+        raw_depth = obs.get("depth")
+        depth = (
+            np.asarray(raw_depth, dtype=np.uint8)[None, ...]
+            if raw_depth is not None
+            else np.zeros((1, rgb.shape[1], rgb.shape[2]), dtype=np.uint8)
+        )
     else:
         hit_type = np.asarray(obs["rays"]["hit_type"], dtype=np.int64)
         ent_feat = np.asarray(obs["visible_entities"]["features"], dtype=np.float32)
@@ -133,9 +140,17 @@ def preprocess_obs_dict(obs: dict, device: torch.device) -> dict[str, torch.Tens
         ent_mask = np.asarray(obs["visible_entities"]["mask"], dtype=np.float32)
         vitals = np.asarray(obs["vitals"], dtype=np.float32)
         rgb = np.asarray(obs["rgb"], dtype=np.uint8)
+        raw_depth = obs.get("depth")
+        depth = (
+            np.asarray(raw_depth, dtype=np.uint8)
+            if raw_depth is not None
+            else np.zeros((rgb.shape[0], rgb.shape[1], rgb.shape[2]), dtype=np.uint8)
+        )
 
     if rgb.shape[1:3] == (120, 160):
         rgb = rgb[:, ::2, ::2, :]
+    if depth.shape[1:3] == (120, 160):
+        depth = depth[:, ::2, ::2]
 
     return {
         "ray_dist": torch.from_numpy(np.ascontiguousarray(dist)).to(device),
@@ -145,6 +160,7 @@ def preprocess_obs_dict(obs: dict, device: torch.device) -> dict[str, torch.Tens
         "ent_mask": torch.from_numpy(np.ascontiguousarray(ent_mask)).to(device),
         "vitals": torch.from_numpy(np.ascontiguousarray(vitals)).to(device),
         "rgb": torch.from_numpy(np.ascontiguousarray(rgb)).to(device),
+        "depth": torch.from_numpy(np.ascontiguousarray(depth)).to(device),
     }
 
 
@@ -389,105 +405,154 @@ class EgoSpatialMemory(nn.Module):
         return self.warp_and_update(prev_map, splat, obs_t["vitals"], prev_action, cond)
 
 
-class RgbEncoder(nn.Module):
-    """Ultra-lightweight 60x80 RGB ConvNet for detecting floor exit pads, signs, and door trims."""
+class RgbDepthEncoder(nn.Module):
+    """Lightweight 60x80 RGB+Depth ConvNet preserving 3x5 horizon/floor bands for doors, switches & exit pads."""
 
-    def __init__(self, out_dim: int = 64):
+    def __init__(self, in_channels: int = 4, out_dim: int = 96):
         super().__init__()
+        self.in_channels = in_channels
         self.conv = nn.Sequential(
-            nn.Conv2d(3, 16, kernel_size=3, stride=2, padding=1),
+            nn.Conv2d(in_channels, 24, kernel_size=5, stride=2, padding=2),
             nn.SiLU(),
-            nn.Conv2d(16, 32, kernel_size=3, stride=2, padding=1),
+            nn.Conv2d(24, 48, kernel_size=3, stride=2, padding=1),
             nn.SiLU(),
-            nn.Conv2d(32, 32, kernel_size=3, stride=2, padding=1),
+            nn.Conv2d(48, 48, kernel_size=3, stride=2, padding=1),
             nn.SiLU(),
-            nn.AdaptiveAvgPool2d((2, 3)),
+            nn.AdaptiveAvgPool2d((3, 5)),
+            nn.Conv2d(48, 24, kernel_size=1),
+            nn.SiLU(),
         )
-        self.proj = nn.Sequential(nn.Linear(32 * 2 * 3, out_dim), nn.SiLU())
+        self.proj = nn.Sequential(nn.Linear(24 * 3 * 5, out_dim), nn.SiLU())
 
-    def forward(self, rgb: torch.Tensor) -> torch.Tensor:
-        x = rgb.permute(0, 3, 1, 2).float() / 255.0
+    def forward(self, rgb: torch.Tensor, depth: torch.Tensor | None = None) -> torch.Tensor:
+        x_rgb = rgb.permute(0, 3, 1, 2).float() / 255.0
+        if self.in_channels == 4:
+            if depth is None:
+                x_d = torch.zeros_like(x_rgb[:, :1])
+            else:
+                x_d = depth.unsqueeze(1).float() / 255.0
+            x = torch.cat([x_rgb, x_d], dim=1)
+        else:
+            x = x_rgb
         return self.proj(self.conv(x).flatten(1))
 
 
 class DoomSpatialPolicy(nn.Module):
-    """Hybrid Vision + Ego-Spatial-Memory Actor-Critic policy for DOOM."""
+    """Hybrid Vision+Depth & Ego-Spatial-Memory Actor-Critic policy for DOOM."""
 
     def __init__(self, cfg: ModelConfig | None = None):
         super().__init__()
         self.cfg = cfg or ModelConfig()
+        self.register_buffer("front5_idx", torch.tensor([62, 63, 0, 1, 2], dtype=torch.long))
         self.ray_enc = RayEncoder(out_dim=128)
-        self.rgb_enc = RgbEncoder(out_dim=64)
+        self.rgb_enc = RgbDepthEncoder(in_channels=4 if self.cfg.use_depth else 3, out_dim=96)
         self.vitals_mlp = nn.Sequential(
-            nn.Linear(VITALS_DIM + NUM_ACTIONS, 64),
+            nn.Linear(VITALS_DIM + NUM_ACTIONS + 6, 80),
             nn.SiLU(),
-            nn.Linear(64, 64),
+            nn.Linear(80, 80),
             nn.SiLU(),
         )
-        self.ent_enc = EntityAttentionEncoder(query_ctx_dim=128 + 64, d_model=64, n_queries=3, out_dim=96)
-        self.spatial_mem = EgoSpatialMemory(self.cfg, cond_dim=64 + 128, out_dim=96)
+        self.ent_enc = EntityAttentionEncoder(query_ctx_dim=128 + 80, d_model=64, n_queries=3, out_dim=96)
+        self.spatial_mem = EgoSpatialMemory(self.cfg, cond_dim=80 + 128, out_dim=96)
 
-        fused_dim = 128 + 64 + 96 + 96 + 64
+        fused_dim = 128 + 80 + 96 + 96 + 96
         self.gru = nn.GRUCell(fused_dim, self.cfg.gru_hidden)
 
         h_dim = self.cfg.gru_hidden
         self.actor = nn.Sequential(
-            nn.Linear(h_dim, 128),
+            nn.Linear(h_dim, 160),
             nn.SiLU(),
-            nn.Linear(128, ACTOR_LOGITS),
+            nn.Linear(160, ACTOR_LOGITS),
         )
         with torch.no_grad():
-            # Prefer looking forward where FOV/RGB points rather than blind sideways strafing
             self.actor[-1].bias.zero_()
             self.actor[-1].bias[1] = 0.6   # MOVE_FORWARD
             self.actor[-1].bias[2] = -0.3  # MOVE_BACKWARD
             self.actor[-1].bias[3] = 0.4   # STRAFE_IDLE
-            self.actor[-1].bias[9] = -0.4  # ATTACK (avoid blind initial spam)
-            self.actor[-1].bias[10] = -0.2  # USE
+            self.actor[-1].bias[9] = -0.5  # ATTACK
+            self.actor[-1].bias[10] = -0.3  # USE
         self.critic = nn.Sequential(
-            nn.Linear(h_dim, 128),
+            nn.Linear(h_dim, 160),
             nn.SiLU(),
-            nn.Linear(128, 1),
+            nn.Linear(160, 1),
         )
         # Auxiliary head predicting next normalized vitals (training-only representation regularizer)
         self.aux_vitals = nn.Linear(h_dim, VITALS_DIM)
 
-    def init_state(self, batch_size: int, device: torch.device) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Return zeroed (gru_h, spatial_map, prev_action) recurrent state."""
+    def init_state(self, batch_size: int, device: torch.device) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return zeroed (gru_h, spatial_map, prev_action, use_cooldown) recurrent state."""
         gru_h = torch.zeros(batch_size, self.cfg.gru_hidden, device=device)
         spatial_map = torch.zeros(
             batch_size, self.cfg.map_channels, self.cfg.map_size, self.cfg.map_size, device=device
         )
         prev_action = torch.zeros(batch_size, NUM_ACTIONS, device=device)
-        return gru_h, spatial_map, prev_action
+        use_cd = torch.zeros(batch_size, 1, device=device)
+        return gru_h, spatial_map, prev_action, use_cd
+
+    @staticmethod
+    def advance_state(
+        next_state: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+        action: torch.Tensor,
+        done_mask: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Advance recurrent memory and rising-edge USE cooldown, masking finished episodes."""
+        gru_h, spatial_map, _, use_cd = next_state
+        next_cd = torch.where(action[:, 7:8] > 0.5, torch.ones_like(use_cd), (use_cd - 0.125).clamp(min=0.0))
+        next_prev = action
+        if done_mask is not None:
+            keep = (1.0 - done_mask).to(gru_h.dtype)
+            gru_h = gru_h * keep.unsqueeze(-1)
+            spatial_map = spatial_map * keep.view(-1, 1, 1, 1)
+            next_prev = next_prev * keep.unsqueeze(-1)
+            next_cd = next_cd * keep.unsqueeze(-1)
+        return gru_h, spatial_map, next_prev, next_cd
+
+    def _tactical_summary(self, obs_t: dict[str, torch.Tensor]) -> torch.Tensor:
+        """Compute smooth continuous door/aim/key summaries strictly from observations."""
+        fd = obs_t["ray_dist"][:, self.front5_idx]  # (B, 5)
+        ft = obs_t["ray_type"][:, self.front5_idx]  # (B, 5)
+        door_prox = torch.where(ft == 2, (1.0 - fd / 0.14).clamp(min=0.0, max=1.0), torch.zeros_like(fd)).amax(dim=-1)
+        lock_prox = torch.where(ft == 3, (1.0 - fd / 0.14).clamp(min=0.0, max=1.0), torch.zeros_like(fd)).amax(dim=-1)
+        wall_prox = torch.where(ft == 1, (1.0 - fd / 0.12).clamp(min=0.0, max=1.0), torch.zeros_like(fd)).amax(dim=-1)
+        has_key = (obs_t["vitals"][:, 8:14].sum(dim=-1) > 0.5).float()
+
+        ef = obs_t["ent_feat"]
+        et = obs_t["ent_type"]
+        em = obs_t["ent_mask"]
+        is_enemy = (et >= 1) & (et <= 3) & (em > 0.5) & (ef[..., 2] > 0.0)
+        aim_score = (1.0 - ef[..., 1].abs() / 0.22).clamp(min=0.0, max=1.0)
+        enemy_aim = torch.where(is_enemy, aim_score, torch.zeros_like(aim_score)).amax(dim=-1)
+        return torch.stack([door_prox, lock_prox, wall_prox, has_key, enemy_aim], dim=-1)
 
     def encode_inputs(
         self, obs_t: dict[str, torch.Tensor], prev_action: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Feed-forward observation encoders (batchable across T*B during PPO BPTT)."""
+    ) -> tuple[torch.Tensor, ...]:
+        """Feed-forward observation encoders (batchable across T*B during sequence BPTT)."""
         v_norm = normalize_vitals(obs_t["vitals"])
-        v_feat = self.vitals_mlp(torch.cat([v_norm, prev_action], dim=-1))
+        tac = self._tactical_summary(obs_t)
+        v_raw_ctx = torch.cat([v_norm, prev_action, tac], dim=-1)
         r_feat = self.ray_enc(obs_t["ray_dist"], obs_t["ray_type"])
-        vis_feat = self.rgb_enc(obs_t["rgb"])
-        e_feat = self.ent_enc(
-            obs_t["ent_feat"], obs_t["ent_type"], obs_t["ent_mask"], torch.cat([r_feat, v_feat], dim=-1)
-        )
+        vis_feat = self.rgb_enc(obs_t["rgb"], obs_t.get("depth"))
         splat = self.spatial_mem._splat_observations(
             obs_t["ray_dist"], obs_t["ray_type"], obs_t["ent_feat"], obs_t["ent_type"], obs_t["ent_mask"]
         )
-        return r_feat, v_feat, e_feat, vis_feat, splat
+        return r_feat, v_raw_ctx, vis_feat, splat, obs_t["ent_feat"], obs_t["ent_type"], obs_t["ent_mask"]
 
     def recurrent_step(
         self,
         r_feat: torch.Tensor,
-        v_feat: torch.Tensor,
-        e_feat: torch.Tensor,
+        v_raw_ctx: torch.Tensor,
         vis_feat: torch.Tensor,
         splat: torch.Tensor,
+        ent_feat: torch.Tensor,
+        ent_type: torch.Tensor,
+        ent_mask: torch.Tensor,
         vitals: torch.Tensor,
-        state: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
-        gru_h, spatial_map, prev_action = state
+        state: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]:
+        gru_h, spatial_map, prev_action, use_cd = state
+        v_feat = self.vitals_mlp(torch.cat([v_raw_ctx, use_cd], dim=-1))
+        e_feat = self.ent_enc(ent_feat, ent_type, ent_mask, torch.cat([r_feat, v_feat], dim=-1))
         m_feat, new_map = self.spatial_mem.warp_and_update(
             spatial_map, splat, vitals, prev_action, torch.cat([v_feat, r_feat], dim=-1)
         )
@@ -496,12 +561,12 @@ class DoomSpatialPolicy(nn.Module):
         logits = self.actor(new_h)
         value = self.critic(new_h).squeeze(-1)
         aux_pred = self.aux_vitals(new_h)
-        return logits, value, aux_pred, (new_h, new_map, prev_action)
+        return logits, value, aux_pred, (new_h, new_map, prev_action, use_cd)
 
     def forward_step(
         self,
         obs_t: dict[str, torch.Tensor],
-        state: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
-        r_feat, v_feat, e_feat, vis_feat, splat = self.encode_inputs(obs_t, state[2])
-        return self.recurrent_step(r_feat, v_feat, e_feat, vis_feat, splat, obs_t["vitals"], state)
+        state: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]:
+        r_feat, v_raw_ctx, vis_feat, splat, ef, et, em = self.encode_inputs(obs_t, state[2])
+        return self.recurrent_step(r_feat, v_raw_ctx, vis_feat, splat, ef, et, em, obs_t["vitals"], state)

@@ -82,6 +82,7 @@ class VecDoomEnv:
     def _stack_obs(obs_list: list[dict]) -> dict:
         return {
             "rgb": np.stack([o["rgb"] for o in obs_list], axis=0),
+            "depth": np.stack([o["depth"] for o in obs_list], axis=0),
             "vitals": np.stack([o["vitals"] for o in obs_list], axis=0),
             "rays": {
                 "distance": np.stack([o["rays"]["distance"] for o in obs_list], axis=0),
@@ -139,13 +140,32 @@ class VecDoomEnv:
                 e.close()
 
 
-def mask_state(state: tuple[torch.Tensor, torch.Tensor, torch.Tensor], done_mask: torch.Tensor):
+def mask_state(state: tuple[torch.Tensor, ...], done_mask: torch.Tensor):
     """Zero recurrent state for environments where an episode just finished (`done_mask` = 1.0)."""
     keep = (1.0 - done_mask).to(state[0].dtype)
     gru_h = state[0] * keep.unsqueeze(-1)
     spatial_map = state[1] * keep.view(-1, 1, 1, 1)
     prev_action = state[2] * keep.unsqueeze(-1)
+    if len(state) >= 4:
+        use_cd = state[3] * keep.unsqueeze(-1)
+        return gru_h, spatial_map, prev_action, use_cd
     return gru_h, spatial_map, prev_action
+
+
+def factor_kl_div(anchor_logits: torch.Tensor, policy_logits: torch.Tensor) -> torch.Tensor:
+    """Exact factorized KL(pi_anchor || pi_policy) over 3 categorical + 3 Bernoulli heads."""
+    kl = policy_logits.new_zeros(policy_logits.shape[:-1])
+    for lo, hi in ((0, 3), (3, 6), (6, 9)):
+        la = anchor_logits[..., lo:hi]
+        lb = policy_logits[..., lo:hi]
+        pa = F.softmax(la, dim=-1)
+        kl = kl + (pa * (F.log_softmax(la, dim=-1) - F.log_softmax(lb, dim=-1))).sum(dim=-1)
+    pa_b = torch.sigmoid(anchor_logits[..., 9:12]).clamp(1e-6, 1.0 - 1e-6)
+    pb_b = torch.sigmoid(policy_logits[..., 9:12]).clamp(1e-6, 1.0 - 1e-6)
+    kl = kl + (
+        pa_b * (pa_b.log() - pb_b.log()) + (1.0 - pa_b) * ((1.0 - pa_b).log() - (1.0 - pb_b).log())
+    ).sum(dim=-1)
+    return kl.mean()
 
 
 def compute_gae(
@@ -200,11 +220,20 @@ def train(args: argparse.Namespace) -> None:
     np.random.seed(args.seed)
 
     cfg = ModelConfig()
+    anchor_policy = None
     policy = DoomSpatialPolicy(cfg).to(device)
     if args.resume and Path(args.resume).is_file():
         ckpt = torch.load(args.resume, map_location=device, weights_only=True)
         policy.load_state_dict(ckpt["model"] if "model" in ckpt else ckpt, strict=True)
         print(f"Resumed weights from {args.resume}")
+
+    if args.resume and Path(args.resume).is_file() and args.anchor_kl > 0.0:
+        anchor_policy = DoomSpatialPolicy(cfg).to(device)
+        anchor_policy.load_state_dict(policy.state_dict(), strict=True)
+        anchor_policy.eval()
+        for p_param in anchor_policy.parameters():
+            p_param.requires_grad_(False)
+        print(f"Enabled KL behavior anchor (coef={args.anchor_kl})")
 
     optimizer = torch.optim.AdamW(policy.parameters(), lr=args.lr, eps=1e-5, weight_decay=1e-4)
 
@@ -219,6 +248,7 @@ def train(args: argparse.Namespace) -> None:
 
     obs_np = vec.reset(seed=args.seed)
     state = policy.init_state(args.num_envs, device)
+    anchor_state = anchor_policy.init_state(args.num_envs, device) if anchor_policy is not None else None
 
     num_updates = max(1, args.total_steps // (args.rollout_len * args.num_envs))
     t_start = time.perf_counter()
@@ -245,6 +275,7 @@ def train(args: argparse.Namespace) -> None:
             roll_next_vitals = []
 
             roll_prev_actions = []
+            roll_anchor_logits = []
             init_state = tuple(s.detach().clone() for s in state)
 
             for _ in range(args.rollout_len):
@@ -255,6 +286,9 @@ def train(args: argparse.Namespace) -> None:
                 with torch.no_grad():
                     logits, value, _, next_state = policy.forward_step(obs_t, state)
                     factor_act, action, logprob = sample_factor_actions(logits, obs_t["vitals"], deterministic=False)
+                    if anchor_policy is not None and anchor_state is not None:
+                        anc_lg, _, _, next_anc_state = anchor_policy.forward_step(obs_t, anchor_state)
+                        roll_anchor_logits.append(anc_lg.cpu())
 
                 act_np = action.cpu().numpy().astype(np.int8)
                 next_obs_np, rews_np, dones_np, infos = vec.step(act_np)
@@ -282,8 +316,9 @@ def train(args: argparse.Namespace) -> None:
                         ep_lens[i] = 0
 
                 done_t = torch.from_numpy(dones_np.astype(np.float32)).to(device)
-                gru_h, s_map, _ = next_state
-                state = mask_state((gru_h, s_map, action), done_t)
+                state = policy.advance_state(next_state, action, done_t)
+                if anchor_policy is not None and anchor_state is not None:
+                    anchor_state = anchor_policy.advance_state(next_anc_state, action, done_t)
                 obs_np = next_obs_np
 
             # Bootstrap last value
@@ -300,6 +335,7 @@ def train(args: argparse.Namespace) -> None:
             prev_actions_t = torch.stack(roll_prev_actions)
             old_logprobs_t = torch.stack(roll_logprobs)
             next_vitals_t = torch.stack(roll_next_vitals)
+            anchor_logits_t = torch.stack(roll_anchor_logits) if roll_anchor_logits else None
             obs_stacked = {k: torch.stack([step[k] for step in roll_obs], dim=0) for k in roll_obs[0]}
 
             adv_t, ret_t = compute_gae(rewards_t, values_t, dones_t, next_value, gamma=args.gamma, gae_lambda=args.gae_lambda)
@@ -331,26 +367,28 @@ def train(args: argparse.Namespace) -> None:
 
                     flat_obs = {k: v[:, idx].reshape(t_len * m_len, *v.shape[2:]).to(device) for k, v in obs_stacked.items()}
                     flat_prev_act = prev_actions_t[:, idx].reshape(t_len * m_len, -1).to(device)
-                    r_all, v_all, e_all, vis_all, s_all = policy.encode_inputs(flat_obs, flat_prev_act)
+                    r_all, vraw_all, vis_all, s_all, ef_all, et_all, em_all = policy.encode_inputs(flat_obs, flat_prev_act)
                     r_seq = r_all.view(t_len, m_len, -1)
-                    v_seq = v_all.view(t_len, m_len, -1)
-                    e_seq = e_all.view(t_len, m_len, -1)
+                    vraw_seq = vraw_all.view(t_len, m_len, -1)
                     vis_seq = vis_all.view(t_len, m_len, -1)
                     s_seq = s_all.view(t_len, m_len, *s_all.shape[1:])
+                    ef_seq = ef_all.view(t_len, m_len, *ef_all.shape[1:])
+                    et_seq = et_all.view(t_len, m_len, *et_all.shape[1:])
+                    em_seq = em_all.view(t_len, m_len, *em_all.shape[1:])
                     vit_seq = obs_stacked["vitals"][:, idx].to(device)
 
                     mb_state = tuple(s[idx_t].clone() for s in init_state)
                     logits_seq, vals_seq, aux_seq = [], [], []
                     for t in range(t_len):
                         lg, vl, ax, next_mb_state = policy.recurrent_step(
-                            r_seq[t], v_seq[t], e_seq[t], vis_seq[t], s_seq[t], vit_seq[t], mb_state
+                            r_seq[t], vraw_seq[t], vis_seq[t], s_seq[t], ef_seq[t], et_seq[t], em_seq[t], vit_seq[t], mb_state
                         )
                         logits_seq.append(lg)
                         vals_seq.append(vl)
                         aux_seq.append(ax)
                         done_step = dones_t[t, idx].to(device)
                         act_step = mb_actions_t[t, idx].to(device)
-                        mb_state = mask_state((next_mb_state[0], next_mb_state[1], act_step), done_step)
+                        mb_state = policy.advance_state(next_mb_state, act_step, done_step)
 
                     lg_all = torch.stack(logits_seq)  # (T, M, 12)
                     vl_all = torch.stack(vals_seq)  # (T, M)
@@ -380,7 +418,21 @@ def train(args: argparse.Namespace) -> None:
                     nonterm = (1.0 - dones_t[:, idx].to(device)).unsqueeze(-1)
                     aux_loss = (F.mse_loss(ax_all, target_v, reduction="none") * nonterm).mean()
 
-                    loss = pg_loss + args.vf_coef * vf_loss - cur_ent_coef * entropy + 0.1 * aux_loss
+                    if update <= args.freeze_actor_updates:
+                        loss = args.vf_coef * vf_loss + 0.1 * aux_loss
+                    else:
+                        kl_anc_loss = (
+                            factor_kl_div(anchor_logits_t[:, idx].to(device), lg_all)
+                            if (anchor_logits_t is not None and args.anchor_kl > 0.0)
+                            else 0.0
+                        )
+                        loss = (
+                            pg_loss
+                            + args.vf_coef * vf_loss
+                            - cur_ent_coef * entropy
+                            + 0.1 * aux_loss
+                            + args.anchor_kl * kl_anc_loss
+                        )
 
                     optimizer.zero_grad()
                     loss.backward()
@@ -415,7 +467,7 @@ def train(args: argparse.Namespace) -> None:
                     f"ret={mean_ret:.2f} exit={exit_rate:.2f} kills={mean_kills:.2f} keys={mean_keys:.2f} doors={mean_doors:.2f} cells={mean_cells:.1f} "
                     f"pg={np.mean(pg_losses):.3f} vf={np.mean(vf_losses):.3f} ent={mean_ent:.2f}"
                 )
-                if len(recent_rets) >= 40 and mean_ent >= 1.2 and mean_ret >= best_ret:
+                if len(recent_rets) >= 40 and mean_ent >= 0.70 and mean_ret >= best_ret:
                     best_ret = mean_ret
                     save_checkpoint(out_path, policy, global_step)
 
@@ -452,6 +504,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--cpu-threads", type=int, default=4, help="PyTorch intra-op CPU threads (4 is optimal on M4)")
     p.add_argument("--no-subproc", action="store_true", help="Run environments synchronously in main process")
     p.add_argument("--resume", type=str, default="", help="Optional checkpoint to resume/fine-tune from")
+    p.add_argument("--freeze-actor-updates", type=int, default=0, help="Warm up critic/encoders before actor PPO updates")
+    p.add_argument("--anchor-kl", type=float, default=0.0, help="KL regularization coef toward frozen --resume policy")
     p.add_argument("--out", type=str, default=str(DEFAULT_OUT), help="Output checkpoint path")
     p.add_argument("--log-every", type=int, default=5)
     p.add_argument("--seed", type=int, default=42)
