@@ -24,9 +24,17 @@ from doom_env import spaces as S
 
 from training.wad_gen import build_map_pool
 
-CELL_SIZE = 96.0
+CELL_SIZE = 192.0  # Room-scale cells so orbiting one room stops paying off quickly
 KEY_ENTITY_ID = S.ENTITY_TYPES.index("key")
+ENEMY_ENTITY_IDS = {
+    S.ENTITY_TYPES.index("enemy_melee"),
+    S.ENTITY_TYPES.index("enemy_hitscan"),
+    S.ENTITY_TYPES.index("enemy_projectile"),
+}
+RAY_DOOR_ID = 2
 RAY_LOCKED_ID = 3  # env/doom_env/sensors.py RAY_LOCKED
+RAY_ENEMY_ID = 4
+FRONT_RAY_IDX = np.array([60, 61, 62, 63, 0, 1, 2, 3, 4], dtype=np.int64)
 FREEDOOM2_IWAD = os.path.join(os.path.dirname(vd.__file__), "freedoom2.wad")
 FREEDOOM_STAGE4_MAPS = ("MAP01", "MAP02", "MAP04", "MAP05", "MAP06")
 
@@ -114,6 +122,8 @@ class ShapedDoomEnv(gym.Env):
         self._prev_door_ceil = ps["sector_ceiling"].copy() if ps["sector_ceiling"] is not None else None
         self._saw_key = False
         self._best_key_dist = 10.0
+        self._saw_door = False
+        self._best_door_dist = 2.0
         self._saw_locked_with_key = False
         self._best_locked_dist = 2.0
         return strip_obs(obs), info
@@ -125,17 +135,20 @@ class ShapedDoomEnv(gym.Env):
         prev = self._prev_ps
 
         reward = -0.001  # small time-efficiency pressure
+        # Gentle reward for forward velocity along camera heading (discourages blind sideways sliding)
+        fwd_vel = max(0.0, float(obs["vitals"][14]))
+        reward += 0.003 * min(1.0, fwd_vel / 15.0)
 
-        # 1) Episodic exploration: reward new 96x96 cells visited
+        # 1) Room-scale episodic exploration (192x192 cells): rewards moving between rooms
         cell = (int(ps["x"] // CELL_SIZE), int(ps["y"] // CELL_SIZE))
         if cell not in self._visited:
             self._visited.add(cell)
-            reward += 0.05
+            reward += 0.12
 
-        # 2) Combat & health/item management
+        # 2) Combat & ammo discipline (discourage blind wall-shooting)
         dkills = ps["kills"] - prev["kills"]
         if dkills > 0:
-            reward += 0.45 * dkills
+            reward += 0.50 * dkills
         ditems = ps["items"] - prev["items"]
         if ditems > 0:
             reward += 0.08 * ditems
@@ -143,36 +156,55 @@ class ShapedDoomEnv(gym.Env):
         if ddmg > 0:
             reward -= 0.01 * ddmg
 
-        # 3) Keycards sighting, monotonic approach & pickup
         ents = obs["visible_entities"]
+        enemy_visible = ((ents["mask"] == 1) & np.isin(ents["entity_type"], list(ENEMY_ENTITY_IDS))).any()
+        enemy_in_front = (obs["rays"]["hit_type"][FRONT_RAY_IDX] == RAY_ENEMY_ID).any()
+        if act[6] == 1 and not enemy_visible and not enemy_in_front:
+            reward -= 0.008
+
+        # 3) Keycards sighting, monotonic approach & pickup
         key_slots = (ents["mask"] == 1) & (ents["entity_type"] == KEY_ENTITY_ID)
         if key_slots.any():
             if not self._saw_key:
                 self._saw_key = True
-                reward += 0.25
+                reward += 0.30
             min_kdist = float(ents["features"][key_slots, 0].min())
             if min_kdist < self._best_key_dist:
                 if self._best_key_dist < 10.0:
-                    reward += 0.4 * (self._best_key_dist - min_kdist)
+                    reward += 0.5 * (self._best_key_dist - min_kdist)
                 self._best_key_dist = min_kdist
 
         dkeys = float(np.sum(ps["keys"] - prev["keys"]))
         if dkeys > 0:
-            reward += 2.0 * dkeys
+            reward += 2.5 * dkeys
             self._saw_key = False
             self._best_key_dist = 10.0
 
-        # 4) Doors & locked doors sighting (when holding a key), approach & opening
+        # 4) Normal doors & locked doors: front-cone approach + opening
+        front_types = obs["rays"]["hit_type"][FRONT_RAY_IDX]
+        front_dists = obs["rays"]["distance"][FRONT_RAY_IDX]
+
+        front_doors = front_types == RAY_DOOR_ID
+        if front_doors.any():
+            if not self._saw_door:
+                self._saw_door = True
+                reward += 0.10
+            min_ddist = float(front_dists[front_doors].min())
+            if min_ddist < self._best_door_dist:
+                if self._best_door_dist < 2.0:
+                    reward += 0.45 * (self._best_door_dist - min_ddist)
+                self._best_door_dist = min_ddist
+
         if np.sum(ps["keys"]) > 0:
             locked_rays = obs["rays"]["hit_type"] == RAY_LOCKED_ID
             if locked_rays.any():
                 if not self._saw_locked_with_key:
                     self._saw_locked_with_key = True
-                    reward += 0.25
+                    reward += 0.30
                 min_ldist = float(obs["rays"]["distance"][locked_rays].min())
                 if min_ldist < self._best_locked_dist:
                     if self._best_locked_dist < 2.0:
-                        reward += 0.5 * (self._best_locked_dist - min_ldist)
+                        reward += 0.6 * (self._best_locked_dist - min_ldist)
                     self._best_locked_dist = min_ldist
 
         ceil = ps["sector_ceiling"]
@@ -183,19 +215,19 @@ class ShapedDoomEnv(gym.Env):
                 sid_int = int(sid)
                 if sid_int not in self._opened_doors:
                     self._opened_doors.add(sid_int)
-                    reward += 2.5 if dlock[sid_int] > 0 else 0.45
-            if act[7] == 1 and self._prev_use == 1:
-                reward -= 0.015
+                    reward += 3.0 if dlock[sid_int] > 0 else 0.70
+                    self._best_door_dist = 2.0
+                    self._saw_door = False
             closing_door = (dlock >= 0) & (ceil < self._prev_door_ceil - 0.5) & (ceil > 8.0)
             if act[7] == 1 and closing_door.any():
-                reward -= 0.05
+                reward -= 0.08
             self._prev_door_ceil = ceil.copy()
 
         # 5) Terminal outcomes
         if ps["exit_reached"]:
             time_frac = max(0.0, 1.0 - ps["tic"] / max(1, ps["episode_ticks"]))
             health_frac = min(1.0, max(0.0, ps["health"] / 100.0))
-            reward += 6.0 + 1.0 * time_frac + 0.5 * health_frac
+            reward += 7.0 + 1.0 * time_frac + 0.5 * health_frac
         elif ps["dead"]:
             reward -= 1.0
 

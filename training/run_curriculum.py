@@ -22,10 +22,10 @@ PRESETS = {
         4: (56_000, 2800, 24),
     },
     "m4_medium": {
-        1: (60_000, 1400, 24),
-        2: (80_000, 2100, 32),
-        3: (120_000, 2800, 32),
-        4: (120_000, 3500, 32),
+        1: (50_000, 1400, 24),
+        2: (70_000, 2100, 32),
+        3: (100_000, 2800, 32),
+        4: (100_000, 3500, 32),
     },
     "m4_full": {
         1: (120_000, 1400, 32),
@@ -68,7 +68,7 @@ def main() -> None:
         t_args.device = args.device
         t_args.resume = resume_path
         t_args.out = str(out_path)
-        t_args.log_every = 5
+        t_args.log_every = 8
         train(t_args)
         stage_copy = ckpt_dir / f"stage{stage}.pt"
         shutil.copy2(out_path, stage_copy)

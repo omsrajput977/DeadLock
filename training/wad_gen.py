@@ -254,8 +254,8 @@ def generate_map_text(tier: int, seed: int) -> str:
         wall_tex.append(wtex)
         return sid
 
-    if tier == 1:
-        # Tier 1: Combat & Survival arena (1-2 rooms, cover pillars, enemies, pickups, exit)
+    if tier == 1 and rng.random() < 0.6:
+        # Tier 1a: Combat & Survival arena (1 room, cover pillars, enemies, pickups, exit)
         w = rng.randint(5, 7)
         h = rng.randint(5, 7)
         wtex = rng.choice(WALL_TEXTURES)
@@ -276,8 +276,6 @@ def generate_map_text(tier: int, seed: int) -> str:
         exit_sec = new_sector(SectorSpec(EXIT_FLAT, CEIL_FLAT, 0, CEIL_HEIGHT, is_exit=True), wtex)
         grid[exit_xy] = exit_sec
 
-        px, py = (0 + 0.5) * TILE_SIZE, (0 + 0.5) * TILE_SIZE
-        # Slight inset so player isn't hugging corner wall
         px, py = 1.2 * TILE_SIZE, 1.2 * TILE_SIZE
         things.append((px, py, rng.choice((0, 45, 90)), THING_PLAYER))
 
@@ -298,15 +296,23 @@ def generate_map_text(tier: int, seed: int) -> str:
 
         return _grid_to_udmf(grid, sectors, things, wall_tex)
 
-    # Tiers 2, 3, 4: Multi-room connected layout on a slot grid
-    if tier == 3 and rng.random() < 0.45:
-        # Compact 3-4 room Tier 3 variant for dense keycard->locked-door curriculum learning
-        grid_cols, grid_rows = 2, 2
-        target_rooms = rng.randint(3, 4)
+    # Multi-room connected layout on a slot grid (includes 2-room combat+door for 40% of Tier 1)
+    if tier == 1:
+        grid_cols, grid_rows, target_rooms = 2, 1, 2
+    elif tier == 3:
+        r = rng.random()
+        if r < 0.30:
+            # 2-room ultra-compact keycard->locked-door warm-up
+            grid_cols, grid_rows, target_rooms = 2, 1, 2
+        elif r < 0.65:
+            # Compact 3-4 room Tier 3 variant
+            grid_cols, grid_rows, target_rooms = 2, 2, rng.randint(3, 4)
+        else:
+            grid_cols, grid_rows, target_rooms = 3, 3, rng.randint(5, 7)
     else:
         grid_cols = 3 if tier >= 3 else rng.choice((2, 3))
         grid_rows = 3 if tier == 4 else rng.choice((2, 3))
-        target_rooms = {2: rng.randint(4, 6), 3: rng.randint(5, 7), 4: rng.randint(6, 9)}[tier]
+        target_rooms = {2: rng.randint(4, 6), 4: rng.randint(6, 9)}[tier]
         target_rooms = min(target_rooms, grid_cols * grid_rows)
 
     # Grow a connected set of slots starting from (0, 0)
@@ -426,11 +432,12 @@ def generate_map_text(tier: int, seed: int) -> str:
 
     # Populate enemies and pickups in non-start rooms
     enemy_pool = {
+        1: [THING_ZOMBIEMAN, THING_SHOTGUNGUY, THING_IMP],
         2: [THING_ZOMBIEMAN],
         3: [THING_ZOMBIEMAN, THING_SHOTGUNGUY, THING_IMP],
         4: [THING_ZOMBIEMAN, THING_SHOTGUNGUY, THING_IMP, THING_DEMON],
     }[tier]
-    enemy_chance = {2: 0.45, 3: 0.65, 4: 0.9}[tier]
+    enemy_chance = {1: 0.9, 2: 0.45, 3: 0.65, 4: 0.9}[tier]
     for slot, r in rooms_by_slot.items():
         if slot == (0, 0):
             # Starter supplies in start room

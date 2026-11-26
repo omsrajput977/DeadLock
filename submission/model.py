@@ -167,13 +167,14 @@ def normalize_vitals(vitals: torch.Tensor) -> torch.Tensor:
 
 
 class RayEncoder(nn.Module):
-    """Circular 1D CNN over 64 ego-centric rays."""
+    """Direction-preserving Circular 1D CNN over 64 ego-centric rays + front-cone features."""
 
     def __init__(self, out_dim: int = 128):
         super().__init__()
         angles = torch.arange(NUM_RAYS, dtype=torch.float32) * (2.0 * math.pi / NUM_RAYS)
         # Store (1, 2, 64) sin/cos positional channels
         self.register_buffer("sincos", torch.stack([torch.sin(angles), torch.cos(angles)], dim=0).unsqueeze(0))
+        self.register_buffer("front_idx", torch.tensor([60, 61, 62, 63, 0, 1, 2, 3, 4], dtype=torch.long))
         in_ch = 1 + NUM_RAY_TYPES + 2
         self.net = nn.Sequential(
             nn.Conv1d(in_ch, 48, kernel_size=5, padding=2, padding_mode="circular"),
@@ -183,14 +184,17 @@ class RayEncoder(nn.Module):
             nn.Conv1d(64, 64, kernel_size=3, stride=2, padding=1, padding_mode="circular"),
             nn.SiLU(),
         )
-        self.proj = nn.Linear(128, out_dim)
+        self.dir_reduce = nn.Sequential(nn.Conv1d(64, 16, kernel_size=1), nn.SiLU())
+        self.proj = nn.Linear(16 * 16 + 128 + 9 * (1 + NUM_RAY_TYPES), out_dim)
 
     def forward(self, ray_dist: torch.Tensor, ray_type: torch.Tensor) -> torch.Tensor:
         bsz = ray_dist.shape[0]
         one_hot = F.one_hot(ray_type.clamp(0, NUM_RAY_TYPES - 1), num_classes=NUM_RAY_TYPES).float()  # (B, 64, 6)
         x = torch.cat([ray_dist.unsqueeze(1), one_hot.permute(0, 2, 1), self.sincos.expand(bsz, -1, -1)], dim=1)
         h = self.net(x)  # (B, 64, 16)
-        pooled = torch.cat([h.mean(dim=-1), h.amax(dim=-1)], dim=-1)  # (B, 128)
+        dir_bins = self.dir_reduce(h).flatten(1)  # (B, 256) preserves 16 angular sectors
+        front_cone = x[:, : 1 + NUM_RAY_TYPES, self.front_idx].flatten(1)  # (B, 63) explicit ahead rays
+        pooled = torch.cat([dir_bins, h.mean(dim=-1), h.amax(dim=-1), front_cone], dim=-1)
         return F.silu(self.proj(pooled))
 
 
@@ -432,6 +436,14 @@ class DoomSpatialPolicy(nn.Module):
             nn.SiLU(),
             nn.Linear(128, ACTOR_LOGITS),
         )
+        with torch.no_grad():
+            # Prefer looking forward where FOV/RGB points rather than blind sideways strafing
+            self.actor[-1].bias.zero_()
+            self.actor[-1].bias[1] = 0.6   # MOVE_FORWARD
+            self.actor[-1].bias[2] = -0.3  # MOVE_BACKWARD
+            self.actor[-1].bias[3] = 0.4   # STRAFE_IDLE
+            self.actor[-1].bias[9] = -0.4  # ATTACK (avoid blind initial spam)
+            self.actor[-1].bias[10] = -0.2  # USE
         self.critic = nn.Sequential(
             nn.Linear(h_dim, 128),
             nn.SiLU(),

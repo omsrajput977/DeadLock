@@ -228,6 +228,7 @@ def train(args: argparse.Namespace) -> None:
     recent_exits: list[float] = []
     recent_kills: list[float] = []
     recent_keys: list[float] = []
+    recent_doors: list[float] = []
     recent_cells: list[float] = []
     best_ret = -1e9
 
@@ -275,6 +276,7 @@ def train(args: argparse.Namespace) -> None:
                         recent_exits.append(1.0 if infos[i].get("exit_reached") else 0.0)
                         recent_kills.append(float(infos[i].get("kills", 0)))
                         recent_keys.append(float(infos[i].get("keys_held", 0)))
+                        recent_doors.append(float(infos[i].get("doors_opened", 0)))
                         recent_cells.append(float(infos[i].get("cells_visited", 0)))
                         ep_returns[i] = 0.0
                         ep_lens[i] = 0
@@ -313,7 +315,10 @@ def train(args: argparse.Namespace) -> None:
             mb_envs = max(1, args.num_envs // args.num_minibatches)
 
             pg_losses, vf_losses, ent_losses, aux_losses = [], [], [], []
+            stop_early = False
             for _ in range(args.ppo_epochs):
+                if stop_early:
+                    break
                 np.random.shuffle(env_perm)
                 for start in range(0, args.num_envs, mb_envs):
                     idx = env_perm[start : start + mb_envs]
@@ -355,7 +360,10 @@ def train(args: argparse.Namespace) -> None:
                     mb_adv = adv_t[:, idx].to(device)
                     mb_ret = ret_t[:, idx].to(device)
 
-                    ratio = torch.exp(new_lp - mb_old_lp)
+                    logratio = new_lp - mb_old_lp
+                    ratio = torch.exp(logratio)
+                    with torch.no_grad():
+                        approx_kl = ((ratio - 1.0) - logratio).mean().item()
                     surr1 = ratio * mb_adv
                     surr2 = torch.clamp(ratio, 1.0 - args.clip_coef, 1.0 + args.clip_coef) * mb_adv
                     pg_loss = -torch.min(surr1, surr2).mean()
@@ -377,6 +385,9 @@ def train(args: argparse.Namespace) -> None:
                     vf_losses.append(vf_loss.item())
                     ent_losses.append(entropy.item())
                     aux_losses.append(aux_loss.item())
+                    if args.target_kl > 0 and approx_kl > args.target_kl:
+                        stop_early = True
+                        break
 
             global_step = update * args.rollout_len * args.num_envs
             if update % args.log_every == 0 or update == num_updates:
@@ -386,17 +397,19 @@ def train(args: argparse.Namespace) -> None:
                 exit_rate = float(np.mean(recent_exits[-40:])) if recent_exits else 0.0
                 mean_kills = float(np.mean(recent_kills[-40:])) if recent_kills else 0.0
                 mean_keys = float(np.mean(recent_keys[-40:])) if recent_keys else 0.0
+                mean_doors = float(np.mean(recent_doors[-40:])) if recent_doors else 0.0
                 mean_cells = float(np.mean(recent_cells[-40:])) if recent_cells else 0.0
+                mean_ent = float(np.mean(ent_losses))
                 print(
                     f"[upd {update}/{num_updates} | steps={global_step} | {sps:.0f} sps] "
-                    f"ret={mean_ret:.2f} exit={exit_rate:.2f} kills={mean_kills:.2f} keys={mean_keys:.2f} cells={mean_cells:.1f} "
-                    f"pg={np.mean(pg_losses):.3f} vf={np.mean(vf_losses):.3f} ent={np.mean(ent_losses):.2f}"
+                    f"ret={mean_ret:.2f} exit={exit_rate:.2f} kills={mean_kills:.2f} keys={mean_keys:.2f} doors={mean_doors:.2f} cells={mean_cells:.1f} "
+                    f"pg={np.mean(pg_losses):.3f} vf={np.mean(vf_losses):.3f} ent={mean_ent:.2f}"
                 )
-                if mean_ret >= best_ret:
+                if len(recent_rets) >= 16 and mean_ent >= 1.2 and mean_ret >= best_ret:
                     best_ret = mean_ret
                     save_checkpoint(Path(args.out), policy, global_step)
 
-        if not Path(args.out).is_file():
+        if best_ret < -1e8 or not Path(args.out).is_file():
             save_checkpoint(Path(args.out), policy, num_updates * args.rollout_len * args.num_envs)
         print(f"Best checkpoint saved to {args.out} (best_ret={best_ret:.2f})")
     finally:
@@ -419,7 +432,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--gae-lambda", type=float, default=0.95)
     p.add_argument("--clip-coef", type=float, default=0.2)
     p.add_argument("--vf-coef", type=float, default=0.5)
-    p.add_argument("--ent-coef", type=float, default=0.008)
+    p.add_argument("--ent-coef", type=float, default=0.012)
+    p.add_argument("--target-kl", type=float, default=0.03)
     p.add_argument("--max-grad-norm", type=float, default=0.5)
     p.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "cuda", "mps"])
     p.add_argument("--cpu-threads", type=int, default=4, help="PyTorch intra-op CPU threads (4 is optimal on M4)")
