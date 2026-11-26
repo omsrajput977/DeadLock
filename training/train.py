@@ -308,6 +308,10 @@ def train(args: argparse.Namespace) -> None:
             # Linear entropy annealing down to 45% of ent_coef to avoid late-stage collapse
             frac = 1.0 - (update - 1) / max(1, num_updates)
             cur_ent_coef = args.ent_coef * (0.45 + 0.55 * frac)
+            warmup = min(1.0, update / 12.0) if args.resume else 1.0
+            cur_lr = args.lr * warmup * (0.35 + 0.65 * frac)
+            for pg in optimizer.param_groups:
+                pg["lr"] = cur_lr
 
             # PPO update over environment minibatches: vectorize encoders across T*M, loop only recurrence
             policy.train()
@@ -357,6 +361,7 @@ def train(args: argparse.Namespace) -> None:
                     entropy = entropy_t.mean()
 
                     mb_old_lp = old_logprobs_t[:, idx].to(device)
+                    mb_old_val = values_t[:, idx].to(device)
                     mb_adv = adv_t[:, idx].to(device)
                     mb_ret = ret_t[:, idx].to(device)
 
@@ -367,7 +372,8 @@ def train(args: argparse.Namespace) -> None:
                     surr1 = ratio * mb_adv
                     surr2 = torch.clamp(ratio, 1.0 - args.clip_coef, 1.0 + args.clip_coef) * mb_adv
                     pg_loss = -torch.min(surr1, surr2).mean()
-                    vf_loss = 0.5 * F.mse_loss(vl_all, mb_ret)
+                    v_clipped = mb_old_val + torch.clamp(vl_all - mb_old_val, -args.clip_coef, args.clip_coef)
+                    vf_loss = 0.5 * torch.max((vl_all - mb_ret).pow(2), (v_clipped - mb_ret).pow(2)).mean()
 
                     # Auxiliary loss only on non-terminal transitions
                     target_v = normalize_vitals(next_vitals_t[:, idx].to(device))
@@ -390,6 +396,10 @@ def train(args: argparse.Namespace) -> None:
                         break
 
             global_step = update * args.rollout_len * args.num_envs
+            out_path = Path(args.out)
+            if update in (num_updates // 3, (2 * num_updates) // 3):
+                snap_tag = "s1" if update == num_updates // 3 else "s2"
+                save_checkpoint(out_path.with_name(f"{out_path.stem}_{snap_tag}{out_path.suffix}"), policy, global_step)
             if update % args.log_every == 0 or update == num_updates:
                 elapsed = time.perf_counter() - t_start
                 sps = global_step / max(1e-6, elapsed)
@@ -405,13 +415,16 @@ def train(args: argparse.Namespace) -> None:
                     f"ret={mean_ret:.2f} exit={exit_rate:.2f} kills={mean_kills:.2f} keys={mean_keys:.2f} doors={mean_doors:.2f} cells={mean_cells:.1f} "
                     f"pg={np.mean(pg_losses):.3f} vf={np.mean(vf_losses):.3f} ent={mean_ent:.2f}"
                 )
-                if len(recent_rets) >= 16 and mean_ent >= 1.2 and mean_ret >= best_ret:
+                if len(recent_rets) >= 40 and mean_ent >= 1.2 and mean_ret >= best_ret:
                     best_ret = mean_ret
-                    save_checkpoint(Path(args.out), policy, global_step)
+                    save_checkpoint(out_path, policy, global_step)
 
-        if best_ret < -1e8 or not Path(args.out).is_file():
-            save_checkpoint(Path(args.out), policy, num_updates * args.rollout_len * args.num_envs)
-        print(f"Best checkpoint saved to {args.out} (best_ret={best_ret:.2f})")
+        final_step = num_updates * args.rollout_len * args.num_envs
+        last_path = out_path.with_name(f"{out_path.stem}_last{out_path.suffix}")
+        save_checkpoint(last_path, policy, final_step)
+        if best_ret < -1e8 or not out_path.is_file():
+            save_checkpoint(out_path, policy, final_step)
+        print(f"Best checkpoint saved to {out_path} (best_ret={best_ret:.2f}), final saved to {last_path}")
     finally:
         vec.close()
 

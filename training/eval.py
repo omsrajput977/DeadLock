@@ -62,6 +62,10 @@ def eval_map(agent: DoomAgent, wad_path: str | Path, map_name: str, episode_tick
 def run_eval(args: argparse.Namespace) -> None:
     dummy = make_env(ROOT / "maps" / "two_rooms.wad", "MAP01", episode_ticks=700, render_buffers=False)
     agent = DoomAgent(dummy.observation_space, dummy.action_space, device=args.device)
+    if args.weights:
+        import torch
+        ckpt = torch.load(args.weights, map_location=args.device, weights_only=True)
+        agent.policy.load_state_dict(ckpt["model"] if "model" in ckpt else ckpt, strict=True)
     if args.deterministic:
         agent.deterministic = True
     dummy.close()
@@ -106,6 +110,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--device", type=str, default="cpu", choices=["cpu", "cuda", "mps"])
     p.add_argument("--maps-per-tier", type=int, default=4)
     p.add_argument("--eval-dir", type=str, default="/tmp/deadlock_eval_maps")
+    p.add_argument("--weights", type=str, default="", help="Optional path to alternate model weights")
     p.add_argument("--deterministic", action="store_true", help="Force greedy argmax instead of agent default")
     return p.parse_args()
 

@@ -25,7 +25,7 @@ class DoomAgent:
         self.action_space = action_space
         self.device = torch.device(device)
         self.deterministic = False
-        self.temperature = 0.75
+        self.temperature = 0.45
 
         ckpt = torch.load(WEIGHTS_PATH, map_location=self.device, weights_only=True) if WEIGHTS_PATH.is_file() else None
         cfg = ModelConfig(**ckpt["config"]) if (ckpt and "config" in ckpt) else ModelConfig()

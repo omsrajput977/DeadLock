@@ -26,25 +26,27 @@ Implemented in [submission/model.py](submission/model.py) and [submission/agent.
 
 ## Training & Exploration Pipeline
 
-- **Procedural UDMF Map Generator ([training/wad_gen.py](training/wad_gen.py)):** Generates 3-lump ZDoom UDMF PWADs across Tiers 1–4 (combat arenas with cover pillars, multi-room door mazes, keycard → locked door → exit branching dungeons, and full gauntlets) without external BSP tools.
-- **Reward Shaping & Backtracking ([training/env_wrapper.py](training/env_wrapper.py)):** Uses `env.privileged_state()` during training for `192×192` room-scale episodic exploration, monotonic keycard/door/locked-door approach shaping, keycard-pickup exploration reset (`_post_key_mode`) to incentivize backtracking out of key branches, ammo-discipline shaping, and a bounded 4-map LRU cache per worker (`--num-envs 6`) for 16 GB RAM efficiency.
-- **Vectorized Recurrent PPO ([training/train.py](training/train.py), [training/run_curriculum.py](training/run_curriculum.py)):** Multi-process `SubprocVecEnv` rollouts with truncated BPTT, GAE, batched feed-forward encoders (`encode_inputs`), `target_kl=0.03` early stopping, entropy annealing, and auxiliary next-vitals supervision across synthetic maps + `freedoom2.wad` (`MAP01`, `MAP02`, `MAP04`, `MAP05`, `MAP06`).
+- **Procedural UDMF Map Generator ([training/wad_gen.py](training/wad_gen.py)):** Generates 3-lump ZDoom UDMF PWADs across Tiers 1–4 (combat arenas with cover pillars, multi-room door mazes with varied elevation/lighting, keycard → locked door → exit branching dungeons with colored door trims, and full gauntlets + wall exit switches) without external BSP tools.
+- **Reward Shaping & Backtracking ([training/env_wrapper.py](training/env_wrapper.py)):** Uses `env.privileged_state()` during training for `128×128` tile-scale episodic exploration, monotonic keycard/door/locked-door approach shaping, keycard-pickup exploration reset (`_post_key_mode`) for backtracking, combat urgency & anti-wall-stall penalties, rising-edge `USE` shaping, and a bounded 4-map LRU cache per worker (`--num-envs 6`) for 16 GB RAM efficiency.
+- **Vectorized Recurrent PPO ([training/train.py](training/train.py), [training/run_curriculum.py](training/run_curriculum.py)):** Multi-process `SubprocVecEnv` rollouts (`gamma=0.995`, truncated BPTT, GAE, PPO clipped value loss, LR warmup/decay, `target_kl=0.03`, auxiliary next-vitals supervision) across 96 procedural maps/tier + `freedoom2.wad` (`MAP01–MAP06`).
 
 ---
 
 ## Zero-Shot Evaluation & Validator Results
 
-Evaluated using [training/eval.py](training/eval.py) / [training/visualize.py](training/visualize.py) (`submission/weights/model.pt`, `2.6 MB` via Git LFS) across **8 unseen procedural maps per tier** and unmodified `freedoom2.wad:MAP01`:
+Evaluated using [training/eval.py](training/eval.py) / [training/visualize.py](training/visualize.py) (`submission/weights/model.pt`, `temperature=0.45`, `2.6 MB` via Git LFS) across **8 unseen procedural maps per tier** and unmodified `freedoom2.wad:MAP01`:
 
 | Benchmark | Exit Rate | Keycard Pickup | Doors Opened | Avg Kills | Cells Visited | p50 Latency |
 | --- | --- | --- | --- | --- | --- | --- |
-| **Tier 1 (8 unseen)** | **50.0%** | 0.0% | 0.25 | 2.25 | 19.6 | 0.96 ms |
-| **Tier 2 (8 unseen)** | **25.0%** | 0.0% | 1.12 | 0.88 | 26.5 | 0.95 ms |
-| **Tier 3 (8 unseen)** | **25.0%** | **50.0%** | 2.62 | 2.00 | 31.4 | 0.95 ms |
-| **Tier 4 (8 unseen)** | **12.5%** | **37.5%** | 4.62 | 6.25 | 41.4 | 0.94 ms |
-| **Freedoom2 MAP01** | 0% | — | 2 | 4 | 73 | 0.94 ms |
+| **Tier 1 (8 unseen)** | **25.0%** | 0.0% | 0.25 | 1.88 | 18.0 | 0.96 ms |
+| **Tier 2 (8 unseen)** | **37.5%** | 0.0% | 1.38 | 1.25 | 21.4 | 0.95 ms |
+| **Tier 3 (8 unseen)** | **50.0%** | **62.5%** | 2.38 | 3.00 | 34.4 | 0.95 ms |
+| **Tier 4 (8 unseen)** | 0.0% | 0.0% | 4.38 | 5.62 | 40.6 | 0.94 ms |
+| **Freedoom2 MAP01** | 0% | — | 2 | 4 | 45 | 0.94 ms |
 
-**Official Validator (`validate.py`):** **PASSED** across `maps/two_rooms.wad` and unseen Tier 1–4 maps (`2.8 MB` of `1.0 GB` repo size, `0.4s` init time, `p50 = 1.1 ms`, `p99 = 1.3–1.7 ms` vs `40.0 ms` budget).
+Across an extended **48-episode-per-tier** zero-shot benchmark (`12` unseen maps × `4` seeds = `192` episodes): **Tier 1 `33.3%`**, **Tier 2 `39.6%`**, **Tier 3 `39.6%` (`58%` keycards)**, **Tier 4 `0.0%` (`10%` keycards, `4.94` kills)**, **`28.1%` mean exit** (up from `26.6%` prior checkpoint), plus `8 kills / 54 cells` on `freedoom2.wad:MAP03`.
+
+**Official Validator (`validate.py`):** **PASSED** across `maps/two_rooms.wad` and unseen Tier 1–4 maps (`2.8 MB` of `1.0 GB` repo size, `0.4s` init time, `p50 = 1.1 ms`, `p99 = 1.2–1.3 ms` vs `40.0 ms` budget).
 
 ---
 

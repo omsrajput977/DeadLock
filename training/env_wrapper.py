@@ -24,7 +24,7 @@ from doom_env import spaces as S
 
 from training.wad_gen import build_map_pool
 
-CELL_SIZE = 192.0  # Room-scale cells so orbiting one room stops paying off quickly
+CELL_SIZE = 128.0  # Tile-scale exploration grid (rewards reaching corners, switches & exits)
 KEY_ENTITY_ID = S.ENTITY_TYPES.index("key")
 ENEMY_ENTITY_IDS = {
     S.ENTITY_TYPES.index("enemy_melee"),
@@ -36,7 +36,7 @@ RAY_LOCKED_ID = 3  # env/doom_env/sensors.py RAY_LOCKED
 RAY_ENEMY_ID = 4
 FRONT_RAY_IDX = np.array([60, 61, 62, 63, 0, 1, 2, 3, 4], dtype=np.int64)
 FREEDOOM2_IWAD = os.path.join(os.path.dirname(vd.__file__), "freedoom2.wad")
-FREEDOOM_STAGE4_MAPS = ("MAP01", "MAP02", "MAP04", "MAP05", "MAP06")
+FREEDOOM_STAGE4_MAPS = ("MAP01", "MAP02", "MAP03", "MAP04", "MAP05", "MAP06")
 
 
 def stripped_obs_space() -> gym.spaces.Dict:
@@ -137,32 +137,40 @@ class ShapedDoomEnv(gym.Env):
         prev = self._prev_ps
 
         reward = -0.001  # small time-efficiency pressure
-        # Gentle reward for forward velocity along camera heading (discourages blind sideways sliding)
-        fwd_vel = max(0.0, float(obs["vitals"][14]))
-        reward += 0.003 * min(1.0, fwd_vel / 15.0)
+        # Urgency cost when out of combat & anti-wall-stall shaping (discourages circling/hugging walls)
+        ents = obs["visible_entities"]
+        enemy_visible = ((ents["mask"] == 1) & np.isin(ents["entity_type"], list(ENEMY_ENTITY_IDS))).any()
+        enemy_in_front = (obs["rays"]["hit_type"][FRONT_RAY_IDX] == RAY_ENEMY_ID).any()
+        if not enemy_visible and not enemy_in_front:
+            reward -= 0.003
+            if abs(float(obs["vitals"][14])) < 1.5 and abs(float(obs["vitals"][15])) < 1.5:
+                reward -= 0.015
+        if self._prev_use == 1 and int(act[7]) == 1:
+            # USE is rising-edge button-down: holding it continuously is ignored by DOOM
+            reward -= 0.015
 
-        # 1) Room-scale episodic exploration (192x192 cells): rewards moving between rooms
+        # 1) Tile-scale episodic exploration (128x128 cells): rewards sweeping rooms & corners
         #    and resets exploration breadcrumbs once a keycard is picked up to reward backtracking.
         cell = (int(ps["x"] // CELL_SIZE), int(ps["y"] // CELL_SIZE))
         self._all_visited.add(cell)
         if cell not in self._visited:
             self._visited.add(cell)
-            reward += 0.06 if self._post_key_mode else 0.12
+            reward += 0.05 if self._post_key_mode else 0.08
 
-        # 2) Combat & ammo discipline (discourage blind wall-shooting)
+        # 2) Combat & ammo discipline (reward decisive kills & survival pickups without timidity)
         dkills = ps["kills"] - prev["kills"]
         if dkills > 0:
-            reward += 0.50 * dkills
+            reward += 0.75 * dkills
         ditems = ps["items"] - prev["items"]
         if ditems > 0:
-            reward += 0.08 * ditems
+            reward += 0.12 * ditems
+        dheal = max(0.0, ps["health"] - prev["health"])
+        if dheal > 0:
+            reward += 0.25
         ddmg = max(0.0, ps["damage_taken"] - prev["damage_taken"])
         if ddmg > 0:
-            reward -= 0.01 * ddmg
+            reward -= 0.010 * ddmg
 
-        ents = obs["visible_entities"]
-        enemy_visible = ((ents["mask"] == 1) & np.isin(ents["entity_type"], list(ENEMY_ENTITY_IDS))).any()
-        enemy_in_front = (obs["rays"]["hit_type"][FRONT_RAY_IDX] == RAY_ENEMY_ID).any()
         if act[6] == 1 and not enemy_visible and not enemy_in_front:
             reward -= 0.008
 
@@ -221,7 +229,7 @@ class ShapedDoomEnv(gym.Env):
                 sid_int = int(sid)
                 if sid_int not in self._opened_doors:
                     self._opened_doors.add(sid_int)
-                    reward += 3.0 if dlock[sid_int] > 0 else 0.70
+                    reward += 3.5 if dlock[sid_int] > 0 else 0.70
                     self._best_door_dist = 2.0
                     self._saw_door = False
             closing_door = (dlock >= 0) & (ceil < self._prev_door_ceil - 0.5) & (ceil > 8.0)
@@ -233,9 +241,9 @@ class ShapedDoomEnv(gym.Env):
         if ps["exit_reached"]:
             time_frac = max(0.0, 1.0 - ps["tic"] / max(1, ps["episode_ticks"]))
             health_frac = min(1.0, max(0.0, ps["health"] / 100.0))
-            reward += 7.0 + 1.0 * time_frac + 0.5 * health_frac
+            reward += 8.5 + 2.0 * time_frac + 1.0 * health_frac
         elif ps["dead"]:
-            reward -= 1.0
+            reward -= 2.0
 
         self._prev_ps = ps
         self._prev_use = int(act[7])
@@ -272,15 +280,17 @@ def curriculum_map_entries(
     elif stage == 3:
         tiers = [1, 2, 2, 3, 3, 3]
     else:
-        tiers = [1, 2, 3, 3, 4, 4]
+        tiers = [1, 1, 2, 2, 3, 3, 4, 4]
     for t in tiers:
         for p in pool[t]:
             entries.append((str(p), "MAP01"))
     if stage >= 2:
-        entries.append((str(Path(__file__).resolve().parents[1] / "maps" / "two_rooms.wad"), "MAP01"))
+        for _ in range(max(1, maps_per_tier // 32)):
+            entries.append((str(Path(__file__).resolve().parents[1] / "maps" / "two_rooms.wad"), "MAP01"))
     if stage == 4 and os.path.isfile(FREEDOOM2_IWAD):
+        repeats = max(1, maps_per_tier // 48)
         for m in FREEDOOM_STAGE4_MAPS:
-            # Repeat twice so Freedoom2 levels make up ~10% of Stage 4 episodes
-            entries.append((FREEDOOM2_IWAD, m))
-            entries.append((FREEDOOM2_IWAD, m))
+            # Keep Freedoom2 MAP01..06 present (~2-5% of episodes) without drowning procedural tiers
+            for _ in range(repeats):
+                entries.append((FREEDOOM2_IWAD, m))
     return entries

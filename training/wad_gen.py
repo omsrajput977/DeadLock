@@ -30,7 +30,9 @@ FLOOR_FLATS = ("FLOOR0_1", "FLOOR4_8", "FLAT5_4", "FLAT1", "FLAT10", "FLAT14", "
 CEIL_FLAT = "CEIL1_1"
 DOOR_TEX = "BIGDOOR2"
 DOOR_TRACK = "DOORTRAK"
+LOCK_TRIMS = {1: "DOORRED", 2: "DOORBLU", 3: "DOORYEL"}
 EXIT_FLAT = "GATE3"
+EXIT_SWITCH_TEX = "SW1BRCOM"
 
 # DoomEdNum thing IDs
 THING_PLAYER = 1
@@ -76,6 +78,7 @@ class SectorSpec:
     is_door: bool = False
     door_lock: int = 0  # 0 = unlocked door, 1/2/3 = R/B/Y locked door
     is_exit: bool = False
+    exit_switch_only: bool = False
 
 
 def _fmt_thing(x: float, y: float, angle: int, doomed: int) -> str:
@@ -116,11 +119,23 @@ def _grid_to_udmf(
         v1 = get_v(*v1_xy)
         v2 = get_v(*v2_xy)
         if back_sec < 0:
-            tex = DOOR_TRACK if sectors[front_sec].is_door else wall_tex_by_sec[front_sec]
+            s_front = sectors[front_sec]
+            if s_front.is_door:
+                tex = LOCK_TRIMS.get(s_front.door_lock, DOOR_TRACK)
+            elif s_front.is_exit and s_front.exit_switch_only:
+                tex = EXIT_SWITCH_TEX
+            else:
+                tex = wall_tex_by_sec[front_sec]
             sf = add_side(front_sec, mid=tex)
-            linedefs.append(
-                f"linedef {{ v1 = {v1}; v2 = {v2}; sidefront = {sf}; blocking = true; dontpegbottom = true; }}"
-            )
+            if s_front.is_exit and s_front.exit_switch_only:
+                linedefs.append(
+                    f"linedef {{ v1 = {v1}; v2 = {v2}; sidefront = {sf}; blocking = true; dontpegbottom = true; "
+                    f"special = 243; playeruse = true; }}"
+                )
+            else:
+                linedefs.append(
+                    f"linedef {{ v1 = {v1}; v2 = {v2}; sidefront = {sf}; blocking = true; dontpegbottom = true; }}"
+                )
             return
 
         # Two-sided edge between front_sec and back_sec.
@@ -145,7 +160,7 @@ def _grid_to_udmf(
                     f"special = 12; arg0 = 0; arg1 = 16; arg2 = 150; "
                     f"playeruse = true; monsteruse = true; repeatspecial = true; }}"
                 )
-        elif b_spec.is_exit:
+        elif b_spec.is_exit and not b_spec.exit_switch_only:
             sf = add_side(front_sec)
             sb = add_side(back_sec)
             linedefs.append(
@@ -337,6 +352,7 @@ def generate_map_text(tier: int, seed: int) -> str:
 
     # Build rooms inside each active slot (centered so adjacent rooms always share overlapping bands)
     rooms_by_slot: dict[tuple[int, int], RoomRect] = {}
+    room_heights: dict[tuple[int, int], tuple[int, int]] = {}
     for rid, (sx, sy) in enumerate(active_slots):
         rw = rng.randint(3, 5)
         rh = rng.randint(3, 5)
@@ -344,7 +360,11 @@ def generate_map_text(tier: int, seed: int) -> str:
         y0 = sy * SLOT_STRIDE + (5 - rh) // 2
         wtex = rng.choice(WALL_TEXTURES)
         ftex = rng.choice(FLOOR_FLATS)
-        sec_id = new_sector(SectorSpec(ftex, CEIL_FLAT, 0, CEIL_HEIGHT), wtex)
+        fh = 0 if (sx, sy) == (0, 0) else rng.choice((-16, 0, 0, 16))
+        ch = fh + rng.choice((112, 128, 160))
+        light = rng.choice((160, 192, 224))
+        sec_id = new_sector(SectorSpec(ftex, CEIL_FLAT, fh, ch, light=light), wtex)
+        room_heights[(sx, sy)] = (fh, ch)
         rect = RoomRect(rid, sx, sy, x0, y0, rw, rh, sec_id)
         rooms_by_slot[(sx, sy)] = rect
         for ix in range(x0, x0 + rw):
@@ -416,11 +436,21 @@ def generate_map_text(tier: int, seed: int) -> str:
             door_sec = None
         _carve_corridor(grid, r_u, r_v, corr_sec, door_sec)
 
-    # Carve exit tile inside exit room
+    # Carve exit tile inside exit room (85% walk-over GATE3 pad, 15% wall exit switch on edge)
     exit_rect = rooms_by_slot[exit_slot]
-    ex_ix = exit_rect.x0 + exit_rect.w // 2
-    ex_iy = exit_rect.y0 + exit_rect.h // 2
-    exit_sec = new_sector(SectorSpec(EXIT_FLAT, CEIL_FLAT, 0, CEIL_HEIGHT, is_exit=True), WALL_TEXTURES[0])
+    ex_fh, ex_ch = room_heights[exit_slot]
+    use_switch = tier >= 2 and rng.random() < 0.15
+    if use_switch:
+        # Pick a corner of exit_rect so at least two walls border solid void (-1) for the switch
+        ex_ix = exit_rect.x0 + exit_rect.w - 1
+        ex_iy = exit_rect.y0 + exit_rect.h - 1
+        exit_sec = new_sector(
+            SectorSpec(EXIT_FLAT, CEIL_FLAT, ex_fh, ex_ch, is_exit=True, exit_switch_only=True), WALL_TEXTURES[0]
+        )
+    else:
+        ex_ix = exit_rect.x0 + exit_rect.w // 2
+        ex_iy = exit_rect.y0 + exit_rect.h // 2
+        exit_sec = new_sector(SectorSpec(EXIT_FLAT, CEIL_FLAT, ex_fh, ex_ch, is_exit=True), WALL_TEXTURES[0])
     grid[(ex_ix, ex_iy)] = exit_sec
 
     # Spawn player in room (0, 0)
