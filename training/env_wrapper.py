@@ -116,6 +116,8 @@ class ShapedDoomEnv(gym.Env):
         ps = self._cur_env.privileged_state()
 
         self._visited = {(int(ps["x"] // CELL_SIZE), int(ps["y"] // CELL_SIZE))}
+        self._all_visited = set(self._visited)
+        self._post_key_mode = False
         self._opened_doors = set()
         self._prev_ps = ps
         self._prev_use = 0
@@ -140,10 +142,12 @@ class ShapedDoomEnv(gym.Env):
         reward += 0.003 * min(1.0, fwd_vel / 15.0)
 
         # 1) Room-scale episodic exploration (192x192 cells): rewards moving between rooms
+        #    and resets exploration breadcrumbs once a keycard is picked up to reward backtracking.
         cell = (int(ps["x"] // CELL_SIZE), int(ps["y"] // CELL_SIZE))
+        self._all_visited.add(cell)
         if cell not in self._visited:
             self._visited.add(cell)
-            reward += 0.12
+            reward += 0.06 if self._post_key_mode else 0.12
 
         # 2) Combat & ammo discipline (discourage blind wall-shooting)
         dkills = ps["kills"] - prev["kills"]
@@ -179,6 +183,8 @@ class ShapedDoomEnv(gym.Env):
             reward += 2.5 * dkeys
             self._saw_key = False
             self._best_key_dist = 10.0
+            self._visited = {cell}
+            self._post_key_mode = True
 
         # 4) Normal doors & locked doors: front-cone approach + opening
         front_types = obs["rays"]["hit_type"][FRONT_RAY_IDX]
@@ -238,7 +244,7 @@ class ShapedDoomEnv(gym.Env):
             **info,
             "kills": ps["kills"],
             "keys_held": int(np.sum(ps["keys"])),
-            "cells_visited": len(self._visited),
+            "cells_visited": len(self._all_visited),
             "doors_opened": len(self._opened_doors),
             "dead": ps["dead"],
         }
@@ -264,9 +270,9 @@ def curriculum_map_entries(
     elif stage == 2:
         tiers = [1, 2, 2]
     elif stage == 3:
-        tiers = [2, 3, 3, 3]
+        tiers = [1, 2, 2, 3, 3, 3]
     else:
-        tiers = [1, 2, 3, 4, 4]
+        tiers = [1, 2, 3, 3, 4, 4]
     for t in tiers:
         for p in pool[t]:
             entries.append((str(p), "MAP01"))

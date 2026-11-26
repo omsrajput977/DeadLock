@@ -309,6 +309,8 @@ def generate_map_text(tier: int, seed: int) -> str:
             grid_cols, grid_rows, target_rooms = 2, 2, rng.randint(3, 4)
         else:
             grid_cols, grid_rows, target_rooms = 3, 3, rng.randint(5, 7)
+    elif tier == 2 and rng.random() < 0.35:
+        grid_cols, grid_rows, target_rooms = 2, 2, 3
     else:
         grid_cols = 3 if tier >= 3 else rng.choice((2, 3))
         grid_rows = 3 if tier == 4 else rng.choice((2, 3))
