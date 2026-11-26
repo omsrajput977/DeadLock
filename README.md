@@ -1,88 +1,93 @@
-# devforge-doom-template
+# DeadLock — Hybrid Vision & Ego-Spatial Memory DOOM RL Agent
 
-Starter template for **Yugaantar 2026 · DevForge — Track 1: "Can It Play DOOM?"**
+Submission for **Yugaantar 2026 · DevForge — Track 1: "Can It Play DOOM?"**
 
-> For decades, *"Can it run DOOM?"* was the ultimate hardware test. Now: **can your neural network
-> actually play DOOM?** Train an agent that plays unseen levels **zero-shot**: survive ambushes,
-> navigate multi-room layouts, find keycards, unlock doors and reach the exit.
+DeadLock is a custom PyTorch reinforcement learning agent trained from scratch to play unseen DOOM levels zero-shot under partial observability—navigating multi-room layouts, fighting enemies, collecting keycards, unlocking locked doors, and reaching level exits at **~1.0 ms** per decision on a single CPU thread.
 
-No dataset is provided. Your agent learns by interacting with the engine.
+---
 
-## Quickstart
+## Architecture (`DoomSpatialPolicy`)
 
-1. Click **"Use this template"** on GitHub to create your team's (public) repository.
-2. Set up the environment (Python 3.13, [uv](https://docs.astral.sh/uv/)):
+Implemented in [submission/model.py](submission/model.py) and [submission/agent.py](submission/agent.py) using pure `torch` + `numpy` (zero extra dependencies beyond the official base image):
 
-   ```bash
-   uv sync                 # installs vizdoom, gymnasium and the official wrapper (env/) in editable mode
-   uv run python validate.py
-   ```
+1. **Direction-Preserving Circular Ray Encoder (`RayEncoder`):**
+   - Processes all 64 360° ego-centric raycasts (`distance` + 6 one-hot `hit_type` classes + `sin/cos` angular embeddings) using a 3-layer **Circular 1D CNN** (`padding_mode="circular"`), preserving 16 directional angular sectors alongside an explicit 9-ray front-cone (`[-22.5°, +22.5°]`) and global pools.
+2. **Masked Entity Set Cross-Attention (`EntityAttentionEncoder`):**
+   - Permutation-invariant attention over variable numbers (`0–32`) of visible entities (`features` + learned `entity_type` embeddings), conditioned on ray + vitals context with NaN-safe empty-mask handling.
+3. **Lightweight Vision Branch (`RgbEncoder`):**
+   - 3-layer strided ConvNet on `60×80×3` downsampled `rgb` frames (`AdaptiveAvgPool2d((2, 3))`) to detect floor exit pads (`GATE3`), exit switches, and door trims invisible to 2D raycasts.
+4. **Differentiable Egocentric 2D Spatial Memory (`EgoSpatialMemory`):**
+   - Maintains a `(16, 25, 25)` egocentric spatial grid (`±1200` map units). Each step warps the previous memory grid via estimated ego-motion (`F.affine_grid` + `F.grid_sample` from `vel_forward`, `vel_right`, and yaw command), splats current ray hits and visible entities into the grid, updates via a gated `3×3` conv residual cell, and reads out via vitals/keycard-conditioned spatial attention.
+5. **Control GRU & Conflict-Free Factorized Action Head:**
+   - A `192`-dim `GRUCell` feeds actor, critic, and auxiliary next-vitals prediction heads.
+   - Outputs `12` factorized logits (`Move(3) × Strafe(3) × Turn(3) × Attack × Use × SwitchWeapon`) mapped deterministically to `MultiBinary(9)`—preventing canceling simultaneous button presses (`FORWARD+BACKWARD`, `TURN_LEFT+TURN_RIGHT`) and masking `SELECT_NEXT_WEAPON` off while the active weapon holds ammo.
 
-   Or use the official image, which is exactly what the scorer runs:
+---
 
-   ```bash
-   docker build -t devforge-doom .            # or: docker pull <official image tag, announced>
-   python validate.py --docker --image devforge-doom   # installs requirements.txt, then runs sandboxed like the scorer
-   ```
+## Training & Exploration Pipeline
 
-3. Replace the random baseline in `submission/agent.py` with your trained agent.
-4. Put weights in `submission/weights/` (Git LFS) and training code in `training/`.
-5. Run `python validate.py --docker` and submit your repo URL.
+- **Procedural UDMF Map Generator ([training/wad_gen.py](training/wad_gen.py)):** Generates 3-lump ZDoom UDMF PWADs across Tiers 1–4 (combat arenas with cover pillars, multi-room door mazes, keycard → locked door → exit branching dungeons, and full gauntlets) without external BSP tools.
+- **Reward Shaping & Backtracking ([training/env_wrapper.py](training/env_wrapper.py)):** Uses `env.privileged_state()` during training for `192×192` room-scale episodic exploration, monotonic keycard/door/locked-door approach shaping, keycard-pickup exploration reset (`_post_key_mode`) to incentivize backtracking out of key branches, ammo-discipline shaping, and a bounded 4-map LRU cache per worker (`--num-envs 6`) for 16 GB RAM efficiency.
+- **Vectorized Recurrent PPO ([training/train.py](training/train.py), [training/run_curriculum.py](training/run_curriculum.py)):** Multi-process `SubprocVecEnv` rollouts with truncated BPTT, GAE, batched feed-forward encoders (`encode_inputs`), `target_kl=0.03` early stopping, entropy annealing, and auxiliary next-vitals supervision across synthetic maps + `freedoom2.wad` (`MAP01`, `MAP02`, `MAP04`, `MAP05`, `MAP06`).
 
-**Platforms:** Linux (x86-64/ARM), macOS on Apple Silicon (macOS 15+) and Windows (x86-64) all
-work with `uv sync` and `validate.py`. Intel Macs have no `vizdoom` 1.3.3 wheel: use Docker or a
-Linux machine. Evaluation runs on Linux, so `validate.py --docker` is the closest check.
+---
 
-## Repository layout
+## Zero-Shot Evaluation & Validator Results
 
+Evaluated using [training/eval.py](training/eval.py) / [training/visualize.py](training/visualize.py) (`submission/weights/model.pt`, `2.6 MB` via Git LFS) across **8 unseen procedural maps per tier** and unmodified `freedoom2.wad:MAP01`:
+
+| Benchmark | Exit Rate | Keycard Pickup | Doors Opened | Avg Kills | Cells Visited | p50 Latency |
+| --- | --- | --- | --- | --- | --- | --- |
+| **Tier 1 (8 unseen)** | **50.0%** | 0.0% | 0.25 | 2.25 | 19.6 | 0.96 ms |
+| **Tier 2 (8 unseen)** | **25.0%** | 0.0% | 1.12 | 0.88 | 26.5 | 0.95 ms |
+| **Tier 3 (8 unseen)** | **25.0%** | **50.0%** | 2.62 | 2.00 | 31.4 | 0.95 ms |
+| **Tier 4 (8 unseen)** | **12.5%** | **37.5%** | 4.62 | 6.25 | 41.4 | 0.94 ms |
+| **Freedoom2 MAP01** | 0% | — | 2 | 4 | 73 | 0.94 ms |
+
+**Official Validator (`validate.py`):** **PASSED** across `maps/two_rooms.wad` and unseen Tier 1–4 maps (`2.8 MB` of `1.0 GB` repo size, `0.4s` init time, `p50 = 1.1 ms`, `p99 = 1.3–1.7 ms` vs `40.0 ms` budget).
+
+---
+
+## Repository Layout
+
+```text
+env/                     Official ViZDoom Gymnasium wrapper (doom_env)
+maps/                    Starter test map (two_rooms.wad)
+submission/
+  agent.py               DoomAgent evaluation entry point (__init__, reset, act)
+  model.py               DoomSpatialPolicy (RayEncoder, RgbEncoder, EntityAttention, EgoSpatialMemory)
+  weights/model.pt       Trained weights (Git LFS)
+  requirements.txt       No extra packages required beyond base image
+training/
+  wad_gen.py             Procedural Tier 1-4 UDMF WAD generator
+  env_wrapper.py         ShapedDoomEnv, backtracking breadcrumbs, Freedoom2 Stage 4 pool
+  train.py               Vectorized Recurrent PPO + BPTT trainer
+  run_curriculum.py      4-stage curriculum launcher (m4_fast / m4_medium / m4_full)
+  eval.py                Zero-shot Tier 1-4 + Freedoom2 evaluator
+  visualize.py           4-panel replay GIFs, storyboards, live viewer & dashboard generator
+validate.py              Official local submission validator
+tests/                   Wrapper and validator test suite
+docs/                    Contract, rules, evaluation, and submission docs
 ```
-env/                  official ViZDoom Gymnasium wrapper (doom_env): spaces, sensors, protocol, limits
-maps/                 one small test map (NOT an evaluation map); bring your own for training
-submission/agent.py   your DoomAgent: the evaluation entry point
-submission/weights/   model weights (Git LFS)
-training/             your training pipeline
-validate.py           run before submitting
-tests/                tests for the wrapper and validator (uv run pytest)
-docs/                 contract, rules, submission guide, evaluation details
+
+---
+
+## Quick Usage
+
+```bash
+# Validate submission interface, size, and latency
+python validate.py
+# Or inside the official Docker sandbox:
+docker build -t devforge-doom . && python validate.py --docker --image devforge-doom
+
+# Run 4-stage curriculum training
+PYTHONPATH=. python -m training.run_curriculum --preset m4_medium
+
+# Evaluate zero-shot across unseen Tier 1-4 maps & Freedoom2 MAP01
+PYTHONPATH=. python -m training.eval --maps-per-tier 8
+
+# Generate replay GIFs, dashboard PNG, and HTML viewer (or pass --live --wad ...)
+PYTHONPATH=. python -m training.visualize --out-dir /tmp/deadlock_viz
 ```
 
-## Using the environment
-
-```python
-from doom_env import make_env
-
-env = make_env("maps/two_rooms.wad")     # test map; use your own maps for training
-obs, info = env.reset(seed=0)
-obs, reward, terminated, truncated, info = env.step(env.action_space.sample())
-```
-
-Observations are a dict of `rgb`, `depth`, `vitals`, `rays` and `visible_entities`, all
-ego-centric and partially observable. See [docs/CONTRACT.md](docs/CONTRACT.md).
-The wrapper's `reward` is a basic default for convenience. Shape your own reward for training.
-
-**Compute tip:** training only on raw pixels is expensive. The `rays`, `visible_entities` and
-`vitals` signals run thousands of steps per second on a CPU. Hybrid pixel + spatial models are welcome.
-
-## Hardware at evaluation
-
-One NVIDIA **RTX 3090 (24 GB)** shared between evaluation workers. Each agent gets **2 GB VRAM,
-8 GB RAM and 1 CPU thread**, so keep models compact and inference fast
-(see [hardware](docs/EVALUATION.md#hardware) and [timeouts](docs/EVALUATION.md#timeouts)).
-`validate.py` runs your agent under the same CPU/RAM limits and reports GPU memory.
-
-## Documentation
-
-| Doc | What's inside |
-| --- | --- |
-| [docs/CONTRACT.md](docs/CONTRACT.md) | Observation/action spaces and the `DoomAgent` interface |
-| [docs/RULES.md](docs/RULES.md) | Ground rules: what's allowed, what gets you disqualified |
-| [docs/SUBMISSION.md](docs/SUBMISSION.md) | Submission checklist, Git LFS, 1 GB limit, `requirements.txt` |
-| [docs/EVALUATION.md](docs/EVALUATION.md) | Map tiers, scoring categories, timeouts, replays |
-
-## Rules in one minute
-
-- Actions must come from **trained neural parameters**: no rule trees, no `A*`/Dijkstra, no `atan2` aimbots,
-  no unmodified off-the-shelf SB3.
-- Change anything you want **during training**. Evaluation uses the **vanilla engine**, the
-  official wrapper and **unseen maps**.
-- Create the repo during the hackathon. Libraries are fine; the core architecture and training must be yours.
+See [docs/CONTRACT.md](docs/CONTRACT.md), [docs/RULES.md](docs/RULES.md), [docs/EVALUATION.md](docs/EVALUATION.md), and [docs/SUBMISSION.md](docs/SUBMISSION.md) for the full competition specification.
