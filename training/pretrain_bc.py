@@ -55,9 +55,9 @@ def _has_lock_key(keys: np.ndarray, lock_num: int) -> bool:
 
 
 class PrivilegedDoomTeacher:
-    """BFS + tactical combat + door-USE choreography teacher (training-only)."""
+    """BFS + tactical combat + door-USE + exploration-first choreography teacher (training-only)."""
 
-    def __init__(self, layout: dict):
+    def __init__(self, layout: dict, explore_first: bool = False, probe_locked: bool = False):
         self.layout = layout
         self.tile_size: float = float(layout["tile_size"])
         self.grid: dict[tuple[int, int], int] = layout["grid"]
@@ -67,6 +67,31 @@ class PrivilegedDoomTeacher:
         self.exit_xy: tuple[int, int] = layout["exit_xy"]
         self.exit_switch_only: bool = bool(layout["exit_switch_only"])
         self.exit_wall_dir: tuple[int, int] | None = layout["exit_wall_dir"]
+
+        self.explore_first = explore_first
+        self.probe_locked = probe_locked
+        self._swept_tiles: set[tuple[int, int]] = set()
+        self._visited_doors: set[int] = set()
+        self._bounced_locked: set[int] = set()
+        self._cur_exp_goal: tuple[str, tuple[int, int], int] | None = None
+        self._door_tiles: list[tuple[int, int]] = [
+            t for t, sid in self.grid.items() if sid in self.door_sectors
+        ]
+        self._locked_door_tiles: dict[int, list[tuple[int, int]]] = {}
+        self._locked_adj_tiles: dict[int, set[tuple[int, int]]] = {}
+        for t, sid in self.grid.items():
+            lock = self.door_lock_map.get(sid, 0)
+            if lock > 0:
+                self._locked_door_tiles.setdefault(sid, []).append(t)
+        for sid, tiles in self._locked_door_tiles.items():
+            adj: set[tuple[int, int]] = set()
+            for tx, ty in tiles:
+                for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                    nt = (tx + dx, ty + dy)
+                    nsid = self.grid.get(nt)
+                    if nsid is not None and self.door_lock_map.get(nsid, 0) == 0 and nsid not in self.door_sectors:
+                        adj.add(nt)
+            self._locked_adj_tiles[sid] = adj
 
         self._prev_ceil: np.ndarray | None = None
         self._use_cd: int = 0
@@ -98,6 +123,38 @@ class PrivilegedDoomTeacher:
                         best = cand
         return best
 
+    def _bfs_tree(
+        self, start: tuple[int, int], keys: np.ndarray
+    ) -> tuple[dict[tuple[int, int], int], dict[tuple[int, int], tuple[int, int] | None]]:
+        q = deque([start])
+        dists: dict[tuple[int, int], int] = {start: 0}
+        parent: dict[tuple[int, int], tuple[int, int] | None] = {start: None}
+        while q:
+            cur = q.popleft()
+            cd = dists[cur]
+            cx, cy = cur
+            for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                nxt = (cx + dx, cy + dy)
+                if nxt not in parent and self._tile_passable(nxt, keys):
+                    parent[nxt] = cur
+                    dists[nxt] = cd + 1
+                    q.append(nxt)
+        return dists, parent
+
+    @staticmethod
+    def _trace_path(
+        parent: dict[tuple[int, int], tuple[int, int] | None], target: tuple[int, int], start: tuple[int, int]
+    ) -> list[tuple[int, int]]:
+        if target not in parent:
+            return [start]
+        path = []
+        node: tuple[int, int] | None = target
+        while node is not None:
+            path.append(node)
+            node = parent[node]
+        path.reverse()
+        return path
+
     def _bfs_path(self, start: tuple[int, int], goals: set[tuple[int, int]], keys: np.ndarray) -> list[tuple[int, int]]:
         if start in goals:
             return [start]
@@ -117,13 +174,115 @@ class PrivilegedDoomTeacher:
                     q.append(nxt)
         if found is None:
             return [start]
-        path = []
-        node: tuple[int, int] | None = found
-        while node is not None:
-            path.append(node)
-            node = parent[node]
-        path.reverse()
-        return path
+        return self._trace_path(parent, found, start)
+
+    def _choose_exploration_path(
+        self,
+        start: tuple[int, int],
+        x: float,
+        y: float,
+        keys: np.ndarray,
+        obs: dict,
+    ) -> list[tuple[int, int]] | None:
+        """Select a realistic partial-observability frontier goal before holding all required keys."""
+        start_sid = self.grid.get(start)
+        if start_sid is not None and start_sid in self.door_sectors:
+            self._visited_doors.add(start_sid)
+
+        # Sweep visible tiles inside current room (line-walkable within ~2.6 tiles)
+        for dx in range(-3, 4):
+            for dy in range(-3, 4):
+                if dx * dx + dy * dy > 7:
+                    continue
+                cand = (start[0] + dx, start[1] + dy)
+                csid = self.grid.get(cand)
+                if csid is None or csid in self.door_sectors:
+                    continue
+                if self._tile_passable(cand, keys) and _line_walkable(self.grid, self.door_lock_map, keys, start, cand):
+                    self._swept_tiles.add(cand)
+
+        # Record bounced locked doors when the agent gets within visual/bumping range with keys=0
+        ft = obs["rays"]["hit_type"][FRONT_RAY_IDX]
+        fd = obs["rays"]["distance"][FRONT_RAY_IDX]
+        close_locked_ray = (((ft == RAY_LOCKED_ID) & (fd < 0.14)).any())
+        for sid, lock in self.door_lock_map.items():
+            if lock <= 0 or _has_lock_key(keys, lock) or sid in self._bounced_locked:
+                continue
+            for lx, ly in self._locked_door_tiles.get(sid, ()):
+                d_u = math.hypot((lx + 0.5) * self.tile_size - x, (ly + 0.5) * self.tile_size - y)
+                if d_u < 110.0 or (close_locked_ray and d_u < 165.0):
+                    self._bounced_locked.add(sid)
+                    break
+
+        dists, parent = self._bfs_tree(start, keys)
+
+        # 1) Any uncollected key clearly visible in the same room / short range
+        vis_keys: list[tuple[int, tuple[int, int]]] = []
+        for kx, ky, lock_num in self.key_items:
+            if not _has_lock_key(keys, lock_num):
+                kt = (int(kx // self.tile_size), int(ky // self.tile_size))
+                d_u = math.hypot(kx - x, ky - y)
+                if kt in dists and d_u < 520.0 and _line_walkable(self.grid, self.door_lock_map, keys, start, kt):
+                    vis_keys.append((dists[kt], kt))
+        if vis_keys:
+            self._cur_exp_goal = None
+            vis_keys.sort(key=lambda item: item[0])
+            return self._trace_path(parent, vis_keys[0][1], start)
+
+        # Reuse active exploration target until completed/unreachable to prevent mid-room oscillation
+        if self._cur_exp_goal is not None:
+            g_kind, g_tile, g_sid = self._cur_exp_goal
+            still_valid = False
+            if g_tile in dists:
+                if g_kind == "door":
+                    still_valid = (g_sid not in self._visited_doors) and self._tile_passable(g_tile, keys)
+                elif g_kind == "tile":
+                    still_valid = g_tile not in self._swept_tiles
+                elif g_kind == "locked":
+                    lock = self.door_lock_map.get(g_sid, 0)
+                    still_valid = (lock > 0) and (not _has_lock_key(keys, lock)) and (g_sid not in self._bounced_locked)
+            if still_valid:
+                return self._trace_path(parent, g_tile, start)
+            self._cur_exp_goal = None
+
+        # 2) Frontier targets: unvisited doors, unswept room corners, or one locked-door probe
+        best_score = 1e9
+        best_goal: tuple[str, tuple[int, int], int] | None = None
+
+        for dt in self._door_tiles:
+            sid = self.grid[dt]
+            if sid not in self._visited_doors and dt in dists and self._tile_passable(dt, keys):
+                score = float(dists[dt])
+                if score < best_score:
+                    best_score = score
+                    best_goal = ("door", dt, sid)
+
+        for t, d in dists.items():
+            if t in self._swept_tiles:
+                continue
+            sid = self.grid.get(t)
+            if sid is not None and sid in self.door_sectors:
+                continue
+            score = float(d) + 0.25
+            if score < best_score:
+                best_score = score
+                best_goal = ("tile", t, sid if sid is not None else -1)
+
+        for sid, lock in self.door_lock_map.items():
+            if lock <= 0 or _has_lock_key(keys, lock) or sid in self._bounced_locked:
+                continue
+            weight = 0.55 if self.probe_locked else 1.0
+            for adj in self._locked_adj_tiles.get(sid, ()):
+                if adj in dists:
+                    score = float(dists[adj]) * weight
+                    if score < best_score:
+                        best_score = score
+                        best_goal = ("locked", adj, sid)
+
+        if best_goal is not None:
+            self._cur_exp_goal = best_goal
+            return self._trace_path(parent, best_goal[1], start)
+        return None
 
     def act(self, obs: dict, ps: dict) -> tuple[np.ndarray, np.ndarray]:
         self._step_idx += 1
@@ -145,14 +304,20 @@ class PrivilegedDoomTeacher:
         start = self._nearest_valid_tile(x, y, keys)
         path: list[tuple[int, int]] = []
         if start is not None:
-            # 1) Prefer uncollected keycard if still unheld and reachable
+            # Check remaining uncollected keycards
             key_goals: set[tuple[int, int]] = set()
             for kx, ky, lock_num in self.key_items:
                 if not _has_lock_key(keys, lock_num):
                     kt = (int(kx // self.tile_size), int(ky // self.tile_size))
                     if self._tile_passable(kt, keys):
                         key_goals.add(kt)
-            if key_goals:
+
+            if self.explore_first and key_goals and self._step_idx < 450:
+                exp_path = self._choose_exploration_path(start, x, y, keys, obs)
+                if exp_path is not None and len(exp_path) >= 1:
+                    path = exp_path
+
+            if not path and key_goals:
                 cand_path = self._bfs_path(start, key_goals, keys)
                 if len(cand_path) >= 1 and cand_path[-1] in key_goals:
                     path = cand_path
@@ -161,13 +326,13 @@ class PrivilegedDoomTeacher:
         else:
             path = [self.exit_xy]
 
-        # Detect closed door immediately ahead along BFS path
+        # Detect closed door immediately ahead along BFS path (only if passable / key held)
         closed_door_xy: tuple[float, float] | None = None
         closed_door_rising = False
         if ceil is not None and floor is not None:
             for tile in path[1:3]:
                 sid = self.grid.get(tile)
-                if sid is not None and sid in self.door_sectors:
+                if sid is not None and sid in self.door_sectors and self._tile_passable(tile, keys):
                     c_val = float(ceil[sid])
                     f_val = float(floor[sid])
                     prev_c = float(self._prev_ceil[sid]) if self._prev_ceil is not None else c_val
@@ -335,14 +500,20 @@ def _make_wad_and_teacher(tier: int, seed: int, wad_path: Path) -> tuple[Path, d
 
 def test_teacher(maps_per_tier: int = 5) -> None:
     tmp_dir = Path(tempfile.mkdtemp(prefix="deadlock_teacher_"))
-    for tier in (1, 2, 3, 4):
+    configs = [(t, False, False, f"Teacher T{t}") for t in (1, 2, 3, 4)] + [
+        (3, True, True, "Teacher-Exp T3"),
+        (4, True, True, "Teacher-Exp T4"),
+    ]
+    for tier, exp_first, probe_lk, label in configs:
         ticks = {1: 1400, 2: 2100, 3: 2800, 4: 3500}[tier]
         exits, kills, keys, doors, shot_at_door = [], [], [], [], []
         for idx in range(maps_per_tier):
-            wad_path, layout = _make_wad_and_teacher(tier, seed=70000 + tier * 100 + idx, wad_path=tmp_dir / f"t{tier}_{idx}.wad")
+            wad_path, layout = _make_wad_and_teacher(
+                tier, seed=70000 + tier * 100 + idx, wad_path=tmp_dir / f"t{tier}_{int(exp_first)}_{idx}.wad"
+            )
             env = make_env(wad_path, "MAP01", episode_ticks=ticks, render_buffers=False)
             obs, _ = env.reset(seed=idx)
-            teacher = PrivilegedDoomTeacher(layout)
+            teacher = PrivilegedDoomTeacher(layout, explore_first=exp_first, probe_locked=probe_lk)
             done = False
             sad = 0
             opened = set()
@@ -371,7 +542,7 @@ def test_teacher(maps_per_tier: int = 5) -> None:
             doors.append(len(opened))
             shot_at_door.append(sad)
         print(
-            f"[Teacher T{tier}] exit={np.mean(exits):.2f} kills={np.mean(kills):.2f} "
+            f"[{label}] exit={np.mean(exits):.2f} kills={np.mean(kills):.2f} "
             f"keys={np.mean(keys):.2f} doors={np.mean(doors):.2f} door_shots={np.mean(shot_at_door):.2f}"
         )
 
@@ -398,7 +569,7 @@ def collect_dagger_episodes(
     exits, kills, keys = [], [], []
     policy.eval()
 
-    tier_weights = (1, 2, 3, 3, 4, 4)
+    tier_weights = (1, 2, 2, 3, 3, 3, 4, 4)
     rng = random.Random(seed_offset)
     for ep_i in range(num_episodes):
         tier = tier_weights[ep_i % len(tier_weights)]
@@ -406,7 +577,9 @@ def collect_dagger_episodes(
         wad_path, layout = _make_wad_and_teacher(tier, seed=seed_offset + ep_i, wad_path=tmp_dir / f"ep_{ep_i}.wad")
         env = make_env(wad_path, "MAP01", episode_ticks=ticks, render_buffers=True)
         obs, _ = env.reset(seed=ep_i)
-        teacher = PrivilegedDoomTeacher(layout)
+        explore_first = (tier == 2 and (ep_i % 3 == 1)) or (tier >= 3 and (ep_i % 5 in (1, 2, 3)))
+        probe_locked = explore_first and (ep_i % 2 == 1)
+        teacher = PrivilegedDoomTeacher(layout, explore_first=explore_first, probe_locked=probe_locked)
         state = policy.init_state(1, device)
 
         ep_obs, ep_prev_act, ep_teacher_f, ep_exec_act, ep_rews, ep_next_v, ep_dones = [], [], [], [], [], [], []
@@ -536,11 +709,12 @@ def train_bc(args: argparse.Namespace) -> None:
                 flat_obs = {k: torch.cat([step[k] for step in obs_seq_list], dim=0).to(device) for k in obs_seq_list[0]}
                 prev_act_seq = torch.stack([replay_buffer[i][1][:min_t] for i in batch_ids], dim=1)  # (T, B, 9)
                 flat_prev = prev_act_seq.reshape(min_t * b_len, -1).to(device)
-                r_all, vraw_all, vis_all, s_all, ef_all, et_all, em_all = policy.encode_inputs(flat_obs, flat_prev)
+                r_all, vraw_all, vis_all, s_all, f_all, ef_all, et_all, em_all = policy.encode_inputs(flat_obs, flat_prev)
                 r_seq = r_all.view(min_t, b_len, -1)
                 vraw_seq = vraw_all.view(min_t, b_len, -1)
                 vis_seq = vis_all.view(min_t, b_len, -1)
                 s_seq = s_all.view(min_t, b_len, *s_all.shape[1:])
+                f_seq = f_all.view(min_t, b_len, *f_all.shape[1:])
                 ef_seq = ef_all.view(min_t, b_len, *ef_all.shape[1:])
                 et_seq = et_all.view(min_t, b_len, *et_all.shape[1:])
                 em_seq = em_all.view(min_t, b_len, *em_all.shape[1:])
@@ -553,7 +727,7 @@ def train_bc(args: argparse.Namespace) -> None:
                 logits_seq, vals_seq, aux_seq = [], [], []
                 for t in range(min_t):
                     lg, vl, ax, nst = policy.recurrent_step(
-                        r_seq[t], vraw_seq[t], vis_seq[t], s_seq[t], ef_seq[t], et_seq[t], em_seq[t], vit_seq[t], state
+                        r_seq[t], vraw_seq[t], vis_seq[t], s_seq[t], f_seq[t], ef_seq[t], et_seq[t], em_seq[t], vit_seq[t], state
                     )
                     logits_seq.append(lg)
                     vals_seq.append(vl)

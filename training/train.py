@@ -146,6 +146,11 @@ def mask_state(state: tuple[torch.Tensor, ...], done_mask: torch.Tensor):
     gru_h = state[0] * keep.unsqueeze(-1)
     spatial_map = state[1] * keep.view(-1, 1, 1, 1)
     prev_action = state[2] * keep.unsqueeze(-1)
+    if len(state) >= 6:
+        use_cd = state[3] * keep.unsqueeze(-1)
+        frontier_map = state[4] * keep.view(-1, 1, 1, 1)
+        prev_keys = state[5] * keep.unsqueeze(-1)
+        return gru_h, spatial_map, prev_action, use_cd, frontier_map, prev_keys
     if len(state) >= 4:
         use_cd = state[3] * keep.unsqueeze(-1)
         return gru_h, spatial_map, prev_action, use_cd
@@ -227,13 +232,15 @@ def train(args: argparse.Namespace) -> None:
         policy.load_state_dict(ckpt["model"] if "model" in ckpt else ckpt, strict=True)
         print(f"Resumed weights from {args.resume}")
 
-    if args.resume and Path(args.resume).is_file() and args.anchor_kl > 0.0:
+    anchor_src = args.anchor_weights if args.anchor_weights else args.resume
+    if anchor_src and Path(anchor_src).is_file() and args.anchor_kl > 0.0:
         anchor_policy = DoomSpatialPolicy(cfg).to(device)
-        anchor_policy.load_state_dict(policy.state_dict(), strict=True)
+        anc_ckpt = torch.load(anchor_src, map_location=device, weights_only=True)
+        anchor_policy.load_state_dict(anc_ckpt["model"] if "model" in anc_ckpt else anc_ckpt, strict=True)
         anchor_policy.eval()
         for p_param in anchor_policy.parameters():
             p_param.requires_grad_(False)
-        print(f"Enabled KL behavior anchor (coef={args.anchor_kl})")
+        print(f"Enabled KL behavior anchor from {anchor_src} (coef={args.anchor_kl})")
 
     optimizer = torch.optim.AdamW(policy.parameters(), lr=args.lr, eps=1e-5, weight_decay=1e-4)
 
@@ -367,11 +374,12 @@ def train(args: argparse.Namespace) -> None:
 
                     flat_obs = {k: v[:, idx].reshape(t_len * m_len, *v.shape[2:]).to(device) for k, v in obs_stacked.items()}
                     flat_prev_act = prev_actions_t[:, idx].reshape(t_len * m_len, -1).to(device)
-                    r_all, vraw_all, vis_all, s_all, ef_all, et_all, em_all = policy.encode_inputs(flat_obs, flat_prev_act)
+                    r_all, vraw_all, vis_all, s_all, f_all, ef_all, et_all, em_all = policy.encode_inputs(flat_obs, flat_prev_act)
                     r_seq = r_all.view(t_len, m_len, -1)
                     vraw_seq = vraw_all.view(t_len, m_len, -1)
                     vis_seq = vis_all.view(t_len, m_len, -1)
                     s_seq = s_all.view(t_len, m_len, *s_all.shape[1:])
+                    f_seq = f_all.view(t_len, m_len, *f_all.shape[1:])
                     ef_seq = ef_all.view(t_len, m_len, *ef_all.shape[1:])
                     et_seq = et_all.view(t_len, m_len, *et_all.shape[1:])
                     em_seq = em_all.view(t_len, m_len, *em_all.shape[1:])
@@ -381,7 +389,7 @@ def train(args: argparse.Namespace) -> None:
                     logits_seq, vals_seq, aux_seq = [], [], []
                     for t in range(t_len):
                         lg, vl, ax, next_mb_state = policy.recurrent_step(
-                            r_seq[t], vraw_seq[t], vis_seq[t], s_seq[t], ef_seq[t], et_seq[t], em_seq[t], vit_seq[t], mb_state
+                            r_seq[t], vraw_seq[t], vis_seq[t], s_seq[t], f_seq[t], ef_seq[t], et_seq[t], em_seq[t], vit_seq[t], mb_state
                         )
                         logits_seq.append(lg)
                         vals_seq.append(vl)
@@ -504,8 +512,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--cpu-threads", type=int, default=4, help="PyTorch intra-op CPU threads (4 is optimal on M4)")
     p.add_argument("--no-subproc", action="store_true", help="Run environments synchronously in main process")
     p.add_argument("--resume", type=str, default="", help="Optional checkpoint to resume/fine-tune from")
+    p.add_argument("--anchor-weights", type=str, default="", help="Optional frozen anchor checkpoint for KL (defaults to --resume)")
     p.add_argument("--freeze-actor-updates", type=int, default=0, help="Warm up critic/encoders before actor PPO updates")
-    p.add_argument("--anchor-kl", type=float, default=0.0, help="KL regularization coef toward frozen --resume policy")
+    p.add_argument("--anchor-kl", type=float, default=0.0, help="KL regularization coef toward frozen anchor policy")
     p.add_argument("--out", type=str, default=str(DEFAULT_OUT), help="Output checkpoint path")
     p.add_argument("--log-every", type=int, default=5)
     p.add_argument("--seed", type=int, default=42)

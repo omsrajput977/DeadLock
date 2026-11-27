@@ -110,6 +110,8 @@ class ModelConfig:
     map_channels: int = 16
     map_size: int = 25
     map_range: float = 1200.0  # +/- 1200 map units around player (~96 units/cell)
+    frontier_size: int = 33
+    frontier_range: float = 1920.0  # +/- 1920 map units persistent visitation & door memory
     gru_hidden: int = 256
     frame_skip: int = 4
     use_depth: bool = True
@@ -274,11 +276,29 @@ class EgoSpatialMemory(nn.Module):
         self.ray_write_emb = nn.Embedding(NUM_RAY_TYPES, c)
         self.ent_write_emb = nn.Embedding(NUM_ENTITY_TYPES, c)
 
-        # Learned turn rate per step (radians) when TURN_LEFT / TURN_RIGHT is pressed (~11 deg/step initial)
-        self.turn_rate = nn.Parameter(torch.tensor(0.20))
+        # Learned turn rate per step (ViZDoom TURN_LEFT/RIGHT ~ 14.0625 deg = 0.2454 rad per 4 tics)
+        self.turn_rate = nn.Parameter(torch.tensor(0.245))
 
         # Gated map update (2xC -> C)
         self.update_conv = nn.Conv2d(2 * c, 2 * c, kernel_size=3, padding=1)
+
+        # Persistent Geometric Frontier Map buffers (3 x 33 x 33: visited, door, locked_door)
+        fs = cfg.frontier_size
+        mid = fs // 2
+        center_mask = torch.zeros(1, 1, fs, fs, dtype=torch.float32)
+        center_mask[:, :, mid : mid + 1, mid : mid + 1] = 1.0
+        self.register_buffer("frontier_center_splat", center_mask)
+
+        # 16 directional frontier probes at [140, 320, 560] units ahead -> (1, 16, 3, 2) normalized grid coords
+        probe_angles = torch.arange(16, dtype=torch.float32) * (2.0 * math.pi / 16.0)
+        probe_dists = torch.tensor([140.0, 320.0, 560.0], dtype=torch.float32) / cfg.frontier_range
+        pf = probe_dists.unsqueeze(0) * torch.cos(probe_angles).unsqueeze(1)  # (16, 3)
+        pr = probe_dists.unsqueeze(0) * (-torch.sin(probe_angles).unsqueeze(1))
+        probe_xy = torch.stack([pr, -pf], dim=-1).unsqueeze(0)  # (1, 16, 3, 2) in [-1, 1]
+        self.register_buffer("frontier_probe_grid", probe_xy)
+
+        # Frontier readout MLP: 16 directions * 3 channels (unvisited_dir, unexplored_door_dir, locked_door_dir) -> 48
+        self.frontier_proj = nn.Sequential(nn.Linear(16 * 3 + 3, 48), nn.SiLU())
 
         # Spatial readout: downsample 25x25 -> 12x12 -> 6x6 and query via conditioned attention
         self.read_conv = nn.Sequential(
@@ -292,7 +312,7 @@ class EgoSpatialMemory(nn.Module):
         self.register_buffer("pos_grid", self._make_pos_grid(read_hw))
         self.cell_proj = nn.Linear(32 + 2, 48)
         self.read_query = nn.Linear(cond_dim, 48)
-        self.out_proj = nn.Sequential(nn.Linear(48 + 32, out_dim), nn.SiLU())
+        self.out_proj = nn.Sequential(nn.Linear(48 + 32 + 48, out_dim), nn.SiLU())
 
     @staticmethod
     def _make_pos_grid(hw: int) -> torch.Tensor:
@@ -300,13 +320,16 @@ class EgoSpatialMemory(nn.Module):
         yy, xx = torch.meshgrid(coords, coords, indexing="ij")
         return torch.stack([xx, yy], dim=0).unsqueeze(0)  # (1, 2, hw, hw)
 
-    def _warp_map(self, prev_map: torch.Tensor, vitals: torch.Tensor, prev_action: torch.Tensor) -> torch.Tensor:
+    def _warp_map(
+        self, prev_map: torch.Tensor, vitals: torch.Tensor, prev_action: torch.Tensor, range_units: float | None = None
+    ) -> torch.Tensor:
         """Rotate and translate `prev_map` (B, C, H, W) into the current ego frame."""
         bsz = prev_map.shape[0]
+        r_scale = self.cfg.map_range if range_units is None else range_units
         # Ego displacement over frame_skip tics, normalized to [-1, 1] grid coordinates
         # Grid coordinates: x = right / map_range, y = -forward / map_range (so top of map = ahead)
-        df = vitals[:, 14] * self.cfg.frame_skip / self.cfg.map_range
-        dr = vitals[:, 15] * self.cfg.frame_skip / self.cfg.map_range
+        df = vitals[:, 14] * self.cfg.frame_skip / r_scale
+        dr = vitals[:, 15] * self.cfg.frame_skip / r_scale
 
         # Estimated yaw delta: TURN_LEFT (idx 4) - TURN_RIGHT (idx 5)
         turn_cmd = prev_action[:, 4] - prev_action[:, 5]
@@ -315,12 +338,12 @@ class EgoSpatialMemory(nn.Module):
         s = torch.sin(dtheta)
 
         # Affine matrix mapping target normalized (x_new, y_new) -> source (x_old, y_old):
-        # Rotate by +dtheta and shift by (+dr, -df)
+        # Turning left (+dtheta) shifts fixed world features clockwise (angle -dtheta) in ego frame.
         theta = torch.zeros(bsz, 2, 3, device=prev_map.device, dtype=prev_map.dtype)
         theta[:, 0, 0] = c
-        theta[:, 0, 1] = -s
+        theta[:, 0, 1] = s
         theta[:, 0, 2] = dr
-        theta[:, 1, 0] = s
+        theta[:, 1, 0] = -s
         theta[:, 1, 1] = c
         theta[:, 1, 2] = -df
 
@@ -366,23 +389,68 @@ class EgoSpatialMemory(nn.Module):
 
         return torch.tanh(obs_grid.view(bsz, c, s, s))
 
+    def _splat_frontier(self, ray_dist: torch.Tensor, ray_type: torch.Tensor) -> torch.Tensor:
+        """Project door (type 2) and locked_door (type 3) ray endpoints onto (B, 2, F, F)."""
+        bsz = ray_dist.shape[0]
+        fs = self.cfg.frontier_size
+        f_range = self.cfg.frontier_range
+        r_units = ray_dist * 1024.0
+        rf = r_units * self.ray_fwd_dir.unsqueeze(0)
+        rr = r_units * self.ray_right_dir.unsqueeze(0)
+        gx = ((rr / f_range + 1.0) * 0.5 * (fs - 1)).round().long().clamp(0, fs - 1)
+        gy = ((-rf / f_range + 1.0) * 0.5 * (fs - 1)).round().long().clamp(0, fs - 1)
+        idx = gy * fs + gx  # (B, 64)
+        grid = ray_dist.new_zeros(bsz, 2, fs * fs)
+        in_range = ray_dist < 0.98
+        door_mask = ((ray_type == 2) & in_range).float()
+        lock_mask = ((ray_type == 3) & in_range).float()
+        grid[:, 0].scatter_add_(1, idx, door_mask)
+        grid[:, 1].scatter_add_(1, idx, lock_mask)
+        return grid.clamp(max=1.0).view(bsz, 2, fs, fs)
+
     def warp_and_update(
         self,
         prev_map: torch.Tensor,
         splat: torch.Tensor,
+        frontier_map: torch.Tensor,
+        frontier_splat: torch.Tensor,
         vitals: torch.Tensor,
         prev_action: torch.Tensor,
+        prev_keys: torch.Tensor,
         cond: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Warp `prev_map` into current ego frame, fuse precomputed `splat`, and read out."""
-        warped = self._warp_map(prev_map, vitals, prev_action)
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Warp neural & geometric frontier maps into ego frame, update, and read 360° directional novelty."""
+        warped = self._warp_map(prev_map, vitals, prev_action, range_units=self.cfg.map_range)
         gate_cand = self.update_conv(torch.cat([warped, splat], dim=1))
         gate, cand = torch.chunk(gate_cand, 2, dim=1)
         z = torch.sigmoid(gate)
         new_map = (1.0 - z) * warped + z * torch.tanh(cand)
 
+        # Persistent Geometric Frontier update (ch0=visited, ch1=doors, ch2=locked_doors)
+        warped_f = self._warp_map(frontier_map, vitals, prev_action, range_units=self.cfg.frontier_range)
+        cur_keys = vitals[:, 8:14].sum(dim=-1, keepdim=True)
+        got_new_key = (cur_keys > prev_keys + 0.5).float().view(-1, 1, 1)
+        # On key pickup, attenuate visited memory so backtracking out to locked doors looks fresh
+        vis_prev = warped_f[:, 0] * (1.0 - 0.75 * got_new_key)
+        vis_new = torch.maximum(vis_prev * 0.9985, self.frontier_center_splat.squeeze(1).expand_as(vis_prev))
+        doors_new = torch.maximum(warped_f[:, 1] * 0.9985, frontier_splat[:, 0])
+        locked_new = torch.maximum(warped_f[:, 2] * 0.9990, frontier_splat[:, 1])
+        new_frontier = torch.stack([vis_new, doors_new, locked_new], dim=1)
+
+        # Sample 16 radial frontier probes at [160, 360, 640] units ahead
+        bsz = prev_map.shape[0]
+        p_grid = self.frontier_probe_grid.expand(bsz, -1, -1, -1)
+        sampled = F.grid_sample(new_frontier, p_grid, mode="bilinear", padding_mode="zeros", align_corners=False)
+        # sampled: (B, 3, 16, 3) -> [vis, doors, locked]
+        s_vis = sampled[:, 0].mean(dim=-1)  # (B, 16)
+        s_door_novel = (sampled[:, 1] - 0.75 * sampled[:, 0]).clamp(min=0.0).amax(dim=-1)  # (B, 16)
+        s_lock = sampled[:, 2].amax(dim=-1)  # (B, 16)
+        local_vis = new_frontier[:, 0, 14:19, 14:19].mean(dim=(1, 2), keepdim=False).unsqueeze(-1)
+        door_tot = (new_frontier[:, 1] - 0.75 * new_frontier[:, 0]).clamp(min=0.0).amax(dim=(1, 2)).unsqueeze(-1)
+        lock_tot = new_frontier[:, 2].amax(dim=(1, 2)).unsqueeze(-1)
+        f_feat = self.frontier_proj(torch.cat([1.0 - s_vis, s_door_novel, s_lock, local_vis, door_tot, lock_tot], dim=-1))
+
         feat_map = self.read_conv(new_map)  # (B, 32, hw, hw)
-        bsz, _ch, _hw, _ = feat_map.shape
         cells = torch.cat([feat_map, self.pos_grid.expand(bsz, -1, -1, -1)], dim=1)  # (B, 34, hw, hw)
         cells_flat = cells.flatten(2).transpose(1, 2)  # (B, hw*hw, 34)
         keys = torch.tanh(self.cell_proj(cells_flat))  # (B, hw*hw, 48)
@@ -390,19 +458,24 @@ class EgoSpatialMemory(nn.Module):
         attn_w = F.softmax((q * keys).sum(dim=-1) / math.sqrt(48.0), dim=-1)  # (B, hw*hw)
         attended = (attn_w.unsqueeze(-1) * keys).sum(dim=1)  # (B, 48)
         pooled = feat_map.mean(dim=(2, 3))  # (B, 32)
-        return self.out_proj(torch.cat([attended, pooled], dim=-1)), new_map
+        return self.out_proj(torch.cat([attended, pooled, f_feat], dim=-1)), new_map, new_frontier
 
     def forward(
         self,
         prev_map: torch.Tensor,
+        frontier_map: torch.Tensor,
         obs_t: dict[str, torch.Tensor],
         prev_action: torch.Tensor,
+        prev_keys: torch.Tensor,
         cond: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         splat = self._splat_observations(
             obs_t["ray_dist"], obs_t["ray_type"], obs_t["ent_feat"], obs_t["ent_type"], obs_t["ent_mask"]
         )
-        return self.warp_and_update(prev_map, splat, obs_t["vitals"], prev_action, cond)
+        f_splat = self._splat_frontier(obs_t["ray_dist"], obs_t["ray_type"])
+        return self.warp_and_update(
+            prev_map, splat, frontier_map, f_splat, obs_t["vitals"], prev_action, prev_keys, cond
+        )
 
 
 class RgbDepthEncoder(nn.Module):
@@ -479,24 +552,28 @@ class DoomSpatialPolicy(nn.Module):
         # Auxiliary head predicting next normalized vitals (training-only representation regularizer)
         self.aux_vitals = nn.Linear(h_dim, VITALS_DIM)
 
-    def init_state(self, batch_size: int, device: torch.device) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Return zeroed (gru_h, spatial_map, prev_action, use_cooldown) recurrent state."""
+    def init_state(self, batch_size: int, device: torch.device) -> tuple[torch.Tensor, ...]:
+        """Return zeroed (gru_h, spatial_map, prev_action, use_cooldown, frontier_map, prev_keys) state."""
         gru_h = torch.zeros(batch_size, self.cfg.gru_hidden, device=device)
         spatial_map = torch.zeros(
             batch_size, self.cfg.map_channels, self.cfg.map_size, self.cfg.map_size, device=device
         )
         prev_action = torch.zeros(batch_size, NUM_ACTIONS, device=device)
         use_cd = torch.zeros(batch_size, 1, device=device)
-        return gru_h, spatial_map, prev_action, use_cd
+        frontier_map = torch.zeros(
+            batch_size, 3, self.cfg.frontier_size, self.cfg.frontier_size, device=device
+        )
+        prev_keys = torch.zeros(batch_size, 1, device=device)
+        return gru_h, spatial_map, prev_action, use_cd, frontier_map, prev_keys
 
     @staticmethod
     def advance_state(
-        next_state: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+        next_state: tuple[torch.Tensor, ...],
         action: torch.Tensor,
         done_mask: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Advance recurrent memory and rising-edge USE cooldown, masking finished episodes."""
-        gru_h, spatial_map, _, use_cd = next_state
+    ) -> tuple[torch.Tensor, ...]:
+        """Advance recurrent memory, frontier map & rising-edge USE cooldown, masking finished episodes."""
+        gru_h, spatial_map, _, use_cd, frontier_map, prev_keys = next_state
         next_cd = torch.where(action[:, 7:8] > 0.5, torch.ones_like(use_cd), (use_cd - 0.125).clamp(min=0.0))
         next_prev = action
         if done_mask is not None:
@@ -505,7 +582,9 @@ class DoomSpatialPolicy(nn.Module):
             spatial_map = spatial_map * keep.view(-1, 1, 1, 1)
             next_prev = next_prev * keep.unsqueeze(-1)
             next_cd = next_cd * keep.unsqueeze(-1)
-        return gru_h, spatial_map, next_prev, next_cd
+            frontier_map = frontier_map * keep.view(-1, 1, 1, 1)
+            prev_keys = prev_keys * keep.unsqueeze(-1)
+        return gru_h, spatial_map, next_prev, next_cd, frontier_map, prev_keys
 
     def _tactical_summary(self, obs_t: dict[str, torch.Tensor]) -> torch.Tensor:
         """Compute smooth continuous door/aim/key summaries strictly from observations."""
@@ -536,7 +615,8 @@ class DoomSpatialPolicy(nn.Module):
         splat = self.spatial_mem._splat_observations(
             obs_t["ray_dist"], obs_t["ray_type"], obs_t["ent_feat"], obs_t["ent_type"], obs_t["ent_mask"]
         )
-        return r_feat, v_raw_ctx, vis_feat, splat, obs_t["ent_feat"], obs_t["ent_type"], obs_t["ent_mask"]
+        f_splat = self.spatial_mem._splat_frontier(obs_t["ray_dist"], obs_t["ray_type"])
+        return r_feat, v_raw_ctx, vis_feat, splat, f_splat, obs_t["ent_feat"], obs_t["ent_type"], obs_t["ent_mask"]
 
     def recurrent_step(
         self,
@@ -544,29 +624,31 @@ class DoomSpatialPolicy(nn.Module):
         v_raw_ctx: torch.Tensor,
         vis_feat: torch.Tensor,
         splat: torch.Tensor,
+        f_splat: torch.Tensor,
         ent_feat: torch.Tensor,
         ent_type: torch.Tensor,
         ent_mask: torch.Tensor,
         vitals: torch.Tensor,
-        state: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]:
-        gru_h, spatial_map, prev_action, use_cd = state
+        state: tuple[torch.Tensor, ...],
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, tuple[torch.Tensor, ...]]:
+        gru_h, spatial_map, prev_action, use_cd, frontier_map, prev_keys = state
         v_feat = self.vitals_mlp(torch.cat([v_raw_ctx, use_cd], dim=-1))
         e_feat = self.ent_enc(ent_feat, ent_type, ent_mask, torch.cat([r_feat, v_feat], dim=-1))
-        m_feat, new_map = self.spatial_mem.warp_and_update(
-            spatial_map, splat, vitals, prev_action, torch.cat([v_feat, r_feat], dim=-1)
+        m_feat, new_map, new_frontier = self.spatial_mem.warp_and_update(
+            spatial_map, splat, frontier_map, f_splat, vitals, prev_action, prev_keys, torch.cat([v_feat, r_feat], dim=-1)
         )
         fused = torch.cat([r_feat, v_feat, e_feat, m_feat, vis_feat], dim=-1)
         new_h = self.gru(fused, gru_h)
         logits = self.actor(new_h)
         value = self.critic(new_h).squeeze(-1)
         aux_pred = self.aux_vitals(new_h)
-        return logits, value, aux_pred, (new_h, new_map, prev_action, use_cd)
+        cur_keys = vitals[:, 8:14].sum(dim=-1, keepdim=True)
+        return logits, value, aux_pred, (new_h, new_map, prev_action, use_cd, new_frontier, cur_keys)
 
     def forward_step(
         self,
         obs_t: dict[str, torch.Tensor],
-        state: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]:
-        r_feat, v_raw_ctx, vis_feat, splat, ef, et, em = self.encode_inputs(obs_t, state[2])
-        return self.recurrent_step(r_feat, v_raw_ctx, vis_feat, splat, ef, et, em, obs_t["vitals"], state)
+        state: tuple[torch.Tensor, ...],
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, tuple[torch.Tensor, ...]]:
+        r_feat, v_raw_ctx, vis_feat, splat, f_splat, ef, et, em = self.encode_inputs(obs_t, state[2])
+        return self.recurrent_step(r_feat, v_raw_ctx, vis_feat, splat, f_splat, ef, et, em, obs_t["vitals"], state)

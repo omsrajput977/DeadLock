@@ -121,6 +121,7 @@ class ShapedDoomEnv(gym.Env):
         self._visited = {(int(ps["x"] // CELL_SIZE), int(ps["y"] // CELL_SIZE))}
         self._all_visited = set(self._visited)
         self._post_key_mode = False
+        self._stale_steps = 0
         self._opened_doors = set()
         self._prev_ps = ps
         self._prev_use = 0
@@ -147,11 +148,15 @@ class ShapedDoomEnv(gym.Env):
         front_dists = obs["rays"]["distance"][FRONT_RAY_IDX]
         enemy_in_front = (front_types == RAY_ENEMY_ID).any()
         door_in_front = (((front_types == RAY_DOOR_ID) | (front_types == RAY_LOCKED_ID)) & (front_dists < 0.25)).any()
+        locked_front_close = (((front_types == RAY_LOCKED_ID) & (front_dists < 0.16)).any())
 
         if not enemy_visible and not enemy_in_front:
             reward -= 0.003
             if abs(float(obs["vitals"][14])) < 1.5 and abs(float(obs["vitals"][15])) < 1.5 and not door_in_front:
                 reward -= 0.015
+        if np.sum(ps["keys"]) == 0 and locked_front_close and (int(act[0]) == 1 or int(act[7]) == 1):
+            # Locked door with no keycard held: discourage hugging or pressing USE into it repeatedly
+            reward -= 0.035
         if self._prev_use == 1 and int(act[7]) == 1:
             # USE is rising-edge button-down: holding it continuously is ignored by DOOM
             reward -= 0.015
@@ -168,11 +173,17 @@ class ShapedDoomEnv(gym.Env):
         if cell not in self._visited:
             self._visited.add(cell)
             reward += 0.04 if self._post_key_mode else 0.07
+            self._stale_steps = 0
+        elif not enemy_visible and not enemy_in_front:
+            self._stale_steps += 1
+            if self._stale_steps > 24:
+                reward -= 0.008
 
         # 2) Combat & ammo discipline (reward decisive kills, punish shooting doors or empty walls)
         dkills = ps["kills"] - prev["kills"]
         if dkills > 0:
             reward += 0.70 * dkills
+            self._stale_steps = 0
         ditems = ps["items"] - prev["items"]
         if ditems > 0:
             reward += 0.12 * ditems
@@ -205,6 +216,7 @@ class ShapedDoomEnv(gym.Env):
             self._best_key_dist = 10.0
             self._visited = {cell}
             self._post_key_mode = True
+            self._stale_steps = 0
 
         # 4) Normal doors & locked doors: front-cone approach + opening
         front_doors = front_types == RAY_DOOR_ID
@@ -241,6 +253,9 @@ class ShapedDoomEnv(gym.Env):
                     reward += 3.5 if dlock[sid_int] > 0 else 0.80
                     self._best_door_dist = 2.0
                     self._saw_door = False
+                    self._stale_steps = 0
+                    if dlock[sid_int] > 0:
+                        self._visited = {cell}
             moving_door = (dlock >= 0) & (np.abs(ceil - self._prev_door_ceil) > 0.5) & (ceil > 8.0)
             if act[7] == 1 and moving_door.any():
                 reward -= 0.08
@@ -250,7 +265,7 @@ class ShapedDoomEnv(gym.Env):
         if ps["exit_reached"]:
             time_frac = max(0.0, 1.0 - ps["tic"] / max(1, ps["episode_ticks"]))
             health_frac = min(1.0, max(0.0, ps["health"] / 100.0))
-            reward += 9.0 + 2.0 * time_frac + 1.0 * health_frac
+            reward += 11.0 + 2.0 * time_frac + 1.0 * health_frac
         elif ps["dead"]:
             reward -= 2.0
 
@@ -289,7 +304,7 @@ def curriculum_map_entries(
     elif stage == 3:
         tiers = [1, 2, 2, 3, 3, 3]
     else:
-        tiers = [1, 1, 2, 2, 3, 3, 4, 4]
+        tiers = [1, 1, 2, 2, 3, 3, 3, 4, 4]
     for t in tiers:
         for p in pool[t]:
             entries.append((str(p), "MAP01"))
