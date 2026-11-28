@@ -18,12 +18,6 @@ if str(ROOT) not in sys.path:
 if str(ROOT / "env") not in sys.path:
     sys.path.insert(0, str(ROOT / "env"))
 
-import gradio as gr
-import numpy as np
-import torch
-import vizdoom as vd
-from doom_env import make_env
-
 try:
     import spaces
 
@@ -33,6 +27,12 @@ except ImportError:
         if fn is None:
             return lambda f: f
         return fn
+
+import gradio as gr
+import numpy as np
+import torch
+import vizdoom as vd
+from doom_env import make_env
 
 from submission.agent import DoomAgent
 from training.env_wrapper import FRONT_RAY_IDX, RAY_DOOR_ID, RAY_LOCKED_ID
@@ -270,17 +270,19 @@ with gr.Blocks(title="DeadLock — Autonomous DOOM RL", theme=gr.themes.Soft()) 
             gpu_btn = gr.Button("Run ZeroGPU Quick Benchmark")
             stats_out = gr.Markdown("Click **Play Live Episode** to start streaming.")
 
-    rand_btn.click(fn=randomize_seed, inputs=None, outputs=seed_in)
+    rand_btn.click(fn=randomize_seed, inputs=None, outputs=seed_in, api_name="randomize_seed")
     live_ev = play_btn.click(
         fn=run_live_episode,
         inputs=[suite_in, seed_in, fps_in, temp_in],
         outputs=[frame_out, stats_out],
+        api_name="play_live",
     )
-    stop_btn.click(fn=None, inputs=None, outputs=None, cancels=[live_ev])
+    stop_btn.click(fn=None, inputs=None, outputs=None, cancels=[live_ev], api_name=False)
     gpu_btn.click(
         fn=run_gpu_benchmark,
         inputs=[suite_in, seed_in, temp_in],
         outputs=[frame_out, stats_out],
+        api_name="gpu_benchmark",
     )
 
 
@@ -288,4 +290,5 @@ if __name__ == "__main__":
     demo.queue().launch(
         server_name="0.0.0.0",
         server_port=int(os.environ.get("PORT", "7860")),
+        ssr_mode=False,
     )

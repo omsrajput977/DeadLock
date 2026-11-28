@@ -4,3 +4,4 @@ gymnasium
 numpy
 pillow
 spaces
+pydantic==2.10.6
