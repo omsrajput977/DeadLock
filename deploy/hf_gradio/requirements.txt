@@ -1,0 +1,6 @@
+torch
+vizdoom==1.3.3
+gymnasium
+numpy
+pillow
+spaces
