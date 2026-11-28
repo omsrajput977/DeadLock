@@ -2,7 +2,7 @@
 title: DeadLock — Autonomous DOOM RL
 emoji: 🎮
 colorFrom: green
-colorTo: slate
+colorTo: gray
 sdk: gradio
 sdk_version: 5.12.0
 python_version: "3.12"

@@ -19,6 +19,7 @@ cd "$ROOT"
 
 echo "Staging Hugging Face Space (${MODE}) bundle in $TMP_DIR ..."
 cp -R env maps submission training "$TMP_DIR/"
+find "$TMP_DIR" -name "__pycache__" -type d -exec rm -rf {} +
 cp .gitattributes "$TMP_DIR/"
 
 if [ "$MODE" = "--docker" ]; then
